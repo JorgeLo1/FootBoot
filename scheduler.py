@@ -1,6 +1,16 @@
 """
 scheduler.py — FOOTBOT
 Orquestador principal del pipeline diario.
+
+CAMBIOS v4:
+  1. Paso 1 usa get_fixtures_today() de _01_data_collector que ya fusiona
+     football-data.org (7 ligas EU) + ESPN (ligas activas adicionales).
+  2. En re-entrenamiento semanal descarga histórico ESPN para ligas sin
+     cobertura de Football-Data.co.uk.
+  3. Paso 2 pasa el ESPN client a build_features_for_fixtures para enriquecer
+     fixtures con cuotas en tiempo real del Core API.
+  4. Paso 4 pasa el historical completo (EU + ESPN) al value detector.
+  5. Resultado_updater usa get_results_today() que fusiona ambas fuentes.
 """
 
 import os
@@ -18,6 +28,7 @@ from config.settings import (
     DATA_RAW, DATA_PROCESSED, MODELS_DIR, LOGS_DIR,
     TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
     FOOTBALL_DATA_ORG_KEY, SUPABASE_URL, SUPABASE_KEY,
+    LIGAS_ESPN, LIGAS_ESPN_ACTIVAS,
 )
 
 os.makedirs(LOGS_DIR, exist_ok=True)
@@ -37,17 +48,20 @@ def validate_credentials() -> list[str]:
     placeholders = {"TU_BOT_TOKEN_AQUI", "TU_CHAT_ID_AQUI",
                     "TU_SUPABASE_URL_AQUI", "TU_SUPABASE_ANON_KEY_AQUI"}
     checks = {
-        "FOOTBALL_DATA_ORG_KEY": FOOTBALL_DATA_ORG_KEY,
-        "TELEGRAM_TOKEN":        TELEGRAM_TOKEN,
-        "TELEGRAM_CHAT_ID":      TELEGRAM_CHAT_ID,
-        "SUPABASE_URL":          SUPABASE_URL,
-        "SUPABASE_KEY":          SUPABASE_KEY,
+        "TELEGRAM_TOKEN":  TELEGRAM_TOKEN,
+        "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+        "SUPABASE_URL":    SUPABASE_URL,
+        "SUPABASE_KEY":    SUPABASE_KEY,
     }
-    return [
+    issues = [
         f"  ✗ {name} no configurada"
         for name, value in checks.items()
         if not value or value in placeholders
     ]
+    # football-data.org es opcional si ESPN cubre las ligas del día
+    if not FOOTBALL_DATA_ORG_KEY:
+        issues.append("  ⚠ FOOTBALL_DATA_ORG_KEY no configurada (ligas EU sin cuotas históricas)")
+    return issues
 
 
 def should_retrain() -> bool:
@@ -63,7 +77,7 @@ def run_pipeline():
 
     issues = validate_credentials()
     if issues:
-        log.warning("Credenciales no configuradas:")
+        log.warning("Credenciales pendientes de configurar:")
         for issue in issues:
             log.warning(issue)
 
@@ -72,55 +86,91 @@ def run_pipeline():
     retrain = should_retrain()
     log.info(f"Re-entrenar modelo hoy: {retrain}")
 
-    # PASO 1 — Recoleccion de datos
+    # ─── PASO 1 — Recolección de datos ────────────────────────────────────────
     log.info("\n> PASO 1 -- Recoleccion de datos")
+    espn_client = None
     try:
         from src._01_data_collector import (
-            get_fixtures_today, download_football_data,
-            download_statsbomb_data, download_elo_ratings,
+            get_fixtures_today,
+            download_football_data,
+            download_statsbomb_data,
+            download_elo_ratings,
+            download_espn_historical,
         )
+        from src.espn_collector import ESPNClient
+
+        # Crear cliente ESPN (reutilizado en todo el pipeline)
+        espn_client = ESPNClient(delay=0.5)
+
+        # Fixtures del día (fd.org EU + ESPN ligas adicionales)
         fixtures = get_fixtures_today()
+
         if fixtures.empty:
             send_telegram(
-                f"FOOTBOT -- {date.today()}\n"
+                f"FOOTBOT — {date.today()}\n"
                 "No hay partidos en las ligas activas hoy."
             )
+            log.info("Sin partidos hoy. Pipeline detenido.")
             return
+
         if retrain:
-            log.info("Actualizando datos historicos...")
+            log.info("Actualizando datos históricos...")
+            # EU: Football-Data.co.uk (CSV con cuotas)
             download_football_data()
             download_statsbomb_data()
+            # Adicionales: ESPN (goles, sin cuotas históricas)
+            log.info("Descargando histórico ESPN para ligas adicionales...")
+            try:
+                download_espn_historical(fetch_plays=False, max_per_team=30)
+            except Exception as e:
+                log.warning(f"ESPN histórico falló (no crítico): {e}")
+
         download_elo_ratings()
         log.info(f"Paso 1 OK: {len(fixtures)} partidos")
+
     except Exception as e:
         log.error(f"Error Paso 1: {e}\n{traceback.format_exc()}")
         send_error_notification(f"Paso 1 fallo:\n{str(e)}")
         return
 
-    # PASO 2 — Feature building
+    # ─── PASO 2 — Feature building ────────────────────────────────────────────
     log.info("\n> PASO 2 -- Construyendo features")
     historical = pd.DataFrame()
     try:
         from src._02_feature_builder import (
-            build_features_for_fixtures, build_training_dataset,
+            build_features_for_fixtures,
+            build_training_dataset,
             load_historical_results,
         )
+
+        # Cargar histórico unificado (EU + ESPN)
         historical  = load_historical_results()
-        features_df = build_features_for_fixtures(fixtures)
+
+        # Pasar espn_client para enriquecer con cuotas en tiempo real
+        features_df = build_features_for_fixtures(fixtures, espn_client=espn_client)
+
         if features_df.empty:
-            send_error_notification("Paso 2: DataFrame de features vacio")
+            send_error_notification("Paso 2: DataFrame de features vacío")
             return
+
         log.info(f"Paso 2 OK: {len(features_df)} partidos con features")
+
+        # Loguear cuántos fixtures tienen cuotas ESPN en tiempo real
+        if "espn_odds_available" in features_df.columns:
+            n_odds = int(features_df["espn_odds_available"].sum())
+            log.info(f"  Cuotas ESPN en tiempo real: {n_odds}/{len(features_df)} partidos")
+
     except Exception as e:
         log.error(f"Error Paso 2: {e}\n{traceback.format_exc()}")
         send_error_notification(f"Paso 2 fallo:\n{str(e)}")
         return
 
-    # PASO 3 — Modelo
+    # ─── PASO 3 — Modelo predictivo ───────────────────────────────────────────
     log.info("\n> PASO 3 -- Modelo predictivo")
     ensemble = None
     try:
         from src._03_model_engine import train_and_save, load_models, predict_match
+
         if retrain:
             log.info("Re-entrenando modelo...")
             try:
@@ -130,7 +180,7 @@ def run_pipeline():
                 log.error(f"Error guardando modelo: {e}")
                 send_error_notification(
                     f"Modelo re-entrenado pero NO guardado:\n{e}\n"
-                    "Se usaran los modelos anteriores."
+                    "Se usarán los modelos anteriores."
                 )
                 dc, ensemble = load_models()
         else:
@@ -158,19 +208,33 @@ def run_pipeline():
         send_error_notification(f"Paso 3 fallo:\n{str(e)}")
         return
 
-    # PASO 4 — Value bets
+    # ─── PASO 4 — Value bets ──────────────────────────────────────────────────
     log.info("\n> PASO 4 -- Deteccion de value bets")
     bets_df = pd.DataFrame()
     try:
         from src._04_value_detector import detect_all_value_bets, summarize_bets
-        # FIX critico: pasar historical para usar cuotas reales de Football-Data
+
+        # Pasar historical para cuotas históricas EU como nivel 2
+        # Las cuotas ESPN nivel 1 ya están en features_df
         bets_df = detect_all_value_bets(features_df, all_predictions, historical)
-        log.info(f"Paso 4 OK: {summarize_bets(bets_df)}")
+        summary = summarize_bets(bets_df)
+        log.info(f"Paso 4 OK: {summary}")
+
+        # Loguear desglose de fuentes de cuotas
+        if "odds_espn_live" in summary:
+            log.info(f"  Cuotas ESPN live: {summary['odds_espn_live']}")
+        if "odds_exact_match" in summary:
+            log.info(f"  Cuotas exactas fd.co.uk: {summary['odds_exact_match']}")
+        if "odds_contextual_avg" in summary:
+            log.info(f"  Cuotas contextuales: {summary['odds_contextual_avg']}")
+        if "odds_fallback" in summary:
+            log.info(f"  Cuotas fallback (sin datos): {summary['odds_fallback']}")
+
     except Exception as e:
         log.error(f"Error Paso 4: {e}\n{traceback.format_exc()}")
         send_error_notification(f"Paso 4 fallo:\n{str(e)}")
 
-    # PASO 5 — Supabase
+    # ─── PASO 5 — Supabase ────────────────────────────────────────────────────
     log.info("\n> PASO 5 -- Guardando en Supabase")
     model_stats = {}
     try:
@@ -185,7 +249,7 @@ def run_pipeline():
     except Exception as e:
         log.error(f"Error Paso 5: {e}\n{traceback.format_exc()}")
 
-    # PASO 6 — Telegram
+    # ─── PASO 6 — Telegram ────────────────────────────────────────────────────
     log.info("\n> PASO 6 -- Enviando a Telegram")
     try:
         from src.telegram_sender import send_daily_report

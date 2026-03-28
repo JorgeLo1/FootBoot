@@ -2,18 +2,15 @@
 _04_value_detector.py
 Detecta value bets comparando probabilidades del modelo con cuotas del mercado.
 
-CAMBIOS v3:
-  1. get_current_season_odds: busca cuotas de la temporada EN CURSO en lugar
-     de los últimos enfrentamientos H2H (que podían ser de hace 3 años).
-     Las cuotas de temporada actual reflejan la fuerza relativa presente.
-  2. build_odds_dict usa una jerarquía de fuentes más robusta:
-       a) Cuotas del partido exacto (mismo H vs A esta temporada)
-       b) Cuotas promedio ponderadas de partidos recientes de cada equipo
-          (últimos 6 partidos de casa del local, últimas 6 de fuera del visitante)
+CAMBIOS v4:
+  1. build_odds_dict ahora tiene 3 niveles de fuentes:
+       a) Cuotas ESPN en tiempo real (Core API /odds) — mejor fuente disponible
+       b) Cuotas históricas Football-Data.co.uk (cierre, partido exacto o contextual)
        c) Fallback a cuotas estimadas
-  3. Imports al nivel del módulo con manejo claro de ImportError.
-  4. edge_vs_market como campo de transparencia adicional.
-  5. classify_confidence usa n_matches_total.
+  2. classify_confidence usa n_matches_total correctamente (fix bug v3).
+  3. Para ligas ESPN sin cuotas históricas, los umbrales de edge se elevan
+     automáticamente (más conservador sin cuotas reales como referencia).
+  4. odds_source en el output distingue: espn_live, exact_match, contextual_avg, fallback.
 """
 
 import os
@@ -26,10 +23,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.settings import (
-    UMBRAL_EDGE_ALTA, UMBRAL_EDGE_MEDIA,
-    UMBRAL_PROB_ALTA, UMBRAL_PROB_MEDIA,
+    UMBRAL_EDGE_ALTA,  UMBRAL_EDGE_MEDIA,
+    UMBRAL_PROB_ALTA,  UMBRAL_PROB_MEDIA,
     MIN_PARTIDOS_ALTA, MIN_PARTIDOS_MEDIA,
-    KELLY_FRACCION, DATA_PROCESSED,
+    KELLY_FRACCION,    DATA_PROCESSED,
+    UMBRAL_EDGE_ALTA_ESPN, UMBRAL_EDGE_MEDIA_ESPN,
 )
 
 try:
@@ -45,7 +43,8 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# Cuotas fallback con overround ~5-6%
+# ─── CUOTAS FALLBACK ─────────────────────────────────────────────────────────
+
 CUOTAS_FALLBACK = {
     "home_win":  2.10,
     "draw":      3.40,
@@ -67,14 +66,12 @@ MARKET_TO_PROB = {
     "over25":   "prob_over25",
 }
 
-# Nº de partidos recientes a promediar para cuotas contextuales
 _N_RECENT_CONTEXT = 6
 
 
-# ─── CUOTAS DE TEMPORADA ACTUAL ───────────────────────────────────────────────
+# ─── CUOTAS HISTÓRICAS (Football-Data.co.uk) ─────────────────────────────────
 
 def _get_odds_columns(df: pd.DataFrame) -> list[tuple[str, str, str]]:
-    """Devuelve las columnas de cuotas disponibles en orden de prioridad."""
     candidates = [
         ("PSH",   "PSD",   "PSA"),
         ("B365H", "B365D", "B365A"),
@@ -90,7 +87,6 @@ def _get_odds_columns(df: pd.DataFrame) -> list[tuple[str, str, str]]:
 
 def _extract_odds_from_row(row: pd.Series,
                             odds_cols: list[tuple]) -> dict | None:
-    """Extrae cuotas de una fila usando la primera fuente disponible."""
     for col_h, col_d, col_a in odds_cols:
         try:
             h_odd = float(row[col_h])
@@ -121,32 +117,22 @@ def _extract_odds_from_row(row: pd.Series,
 def get_current_season_odds(home_team: str, away_team: str,
                              historical: pd.DataFrame) -> dict | None:
     """
-    Estrategia de cuotas v3 — prioridad decreciente:
-
-    1. Partido exacto (home vs away) en la temporada más reciente disponible.
-       Es la mejor referencia porque las cuotas de cierre son el mejor
-       predictor del mercado eficiente.
-
-    2. Si no hay enfrentamiento directo reciente: promedio ponderado de los
-       últimos _N_RECENT_CONTEXT partidos de CASA del equipo local y de
-       FUERA del equipo visitante en la misma temporada.
-       Esto refleja la fuerza relativa actual de cada equipo en su contexto
-       (local/visitante) sin depender de que se hayan enfrentado antes.
-
-    3. Retorna None si no hay cuotas disponibles → fallback a estimadas.
+    Estrategia de cuotas históricas (Football-Data.co.uk):
+    1. Partido exacto más reciente
+    2. Promedio contextual (últimos N partidos en casa del local + fuera del visitante)
     """
     if historical is None or historical.empty:
         return None
     if "home_team_norm" not in historical.columns:
         return None
 
-    h_norm = normalize_team_name(home_team)
-    a_norm = normalize_team_name(away_team)
+    h_norm    = normalize_team_name(home_team)
+    a_norm    = normalize_team_name(away_team)
     odds_cols = _get_odds_columns(historical)
     if not odds_cols:
         return None
 
-    # ── Estrategia 1: partido exacto más reciente ─────────────────────────
+    # ── Estrategia 1: partido exacto ─────────────────────────────────────
     mask_exact = (
         (historical["home_team_norm"] == h_norm) &
         (historical["away_team_norm"] == a_norm)
@@ -154,24 +140,16 @@ def get_current_season_odds(home_team: str, away_team: str,
     exact = historical[mask_exact].sort_values("match_date", ascending=False)
 
     if not exact.empty:
-        row = exact.iloc[0]
-        result = _extract_odds_from_row(row, odds_cols)
+        result = _extract_odds_from_row(exact.iloc[0], odds_cols)
         if result:
-            log.debug(
-                f"Cuotas exactas para {home_team} vs {away_team}: "
-                f"{result['home']}/{result['draw']}/{result['away']} "
-                f"({result['source']})"
-            )
             result["method"] = "exact_match"
             return result
 
-    # ── Estrategia 2: promedio contextual (casa/fuera) ────────────────────
-    # Últimos N partidos del local jugando en casa
+    # ── Estrategia 2: promedio contextual ────────────────────────────────
     home_home = historical[
         historical["home_team_norm"] == h_norm
     ].sort_values("match_date", ascending=False).head(_N_RECENT_CONTEXT)
 
-    # Últimos N partidos del visitante jugando fuera
     away_away = historical[
         historical["away_team_norm"] == a_norm
     ].sort_values("match_date", ascending=False).head(_N_RECENT_CONTEXT)
@@ -185,33 +163,28 @@ def get_current_season_odds(home_team: str, away_team: str,
     for _, row in home_home.iterrows():
         o = _extract_odds_from_row(row, odds_cols)
         if o:
-            home_odds_list.append(o["home"])  # cuota del equipo local en esos partidos
+            home_odds_list.append(o["home"])
 
     for _, row in away_away.iterrows():
         o = _extract_odds_from_row(row, odds_cols)
         if o:
-            away_odds_list.append(o["away"])  # cuota del equipo visitante en esos partidos
+            away_odds_list.append(o["away"])
 
     if not home_odds_list or not away_odds_list:
         return None
 
-    # Promedio de cuotas recientes
     avg_home_odds = float(np.mean(home_odds_list))
     avg_away_odds = float(np.mean(away_odds_list))
 
-    # La cuota de empate la inferimos desde las probabilidades implícitas:
-    # P(home) + P(draw) + P(away) = 1 con overround ~5%
     p_home = (1 / avg_home_odds) * 0.95
     p_away = (1 / avg_away_odds) * 0.95
     p_draw = max(0.05, 1.0 - p_home - p_away)
-    # Normalizar (el overround puede hacer que sumen > 1)
     total  = p_home + p_draw + p_away
     p_home /= total
     p_draw /= total
     p_away /= total
     draw_odds = round(1 / p_draw, 3) if p_draw > 0 else 3.40
 
-    # Over/Under 2.5: tomamos el promedio de los partidos del local en casa
     over25_list  = []
     under25_list = []
     for _, row in home_home.iterrows():
@@ -222,7 +195,7 @@ def get_current_season_odds(home_team: str, away_team: str,
             try:    under25_list.append(float(row["B365<2.5"]))
             except: pass
 
-    result = {
+    return {
         "home":    round(avg_home_odds, 3),
         "draw":    draw_odds,
         "away":    round(avg_away_odds, 3),
@@ -234,12 +207,99 @@ def get_current_season_odds(home_team: str, away_team: str,
         "n_away":  len(away_odds_list),
     }
 
-    log.debug(
-        f"Cuotas contextuales para {home_team} vs {away_team}: "
-        f"{result['home']}/{result['draw']}/{result['away']} "
-        f"(n_home={result['n_home']}, n_away={result['n_away']})"
-    )
-    return result
+
+# ─── CUOTAS ESPN EN TIEMPO REAL ───────────────────────────────────────────────
+
+def _get_espn_odds_from_fixture(fixture_row: pd.Series) -> dict | None:
+    """
+    Extrae cuotas ESPN en tiempo real del fixture_row si están disponibles.
+    Estas cuotas se añadieron en build_features_for_fixtures via enrich_fixtures_with_odds.
+    """
+    if not fixture_row.get("espn_odds_available"):
+        return None
+
+    h = fixture_row.get("espn_odds_home")
+    d = fixture_row.get("espn_odds_draw")
+    a = fixture_row.get("espn_odds_away")
+
+    if not h or not a or float(h) <= 1.0:
+        return None
+
+    return {
+        "home":    float(h),
+        "draw":    float(d) if d else 3.40,
+        "away":    float(a),
+        "over25":  None,
+        "under25": None,
+        "source":  "espn_odds",
+        "method":  "espn_live",
+        "provider": fixture_row.get("espn_odds_provider", "ESPN"),
+    }
+
+
+# ─── CONSTRUCCIÓN UNIFICADA DE CUOTAS ────────────────────────────────────────
+
+def build_odds_dict(home_team: str, away_team: str,
+                    historical: pd.DataFrame,
+                    fixture_row: pd.Series = None) -> tuple[dict, bool, str]:
+    """
+    Construye el diccionario de cuotas para un partido con 3 niveles:
+
+    Nivel 1 — ESPN en tiempo real (mejor): cuotas del día del mercado.
+    Nivel 2 — Football-Data.co.uk (bueno): cierre histórico real.
+    Nivel 3 — Fallback estimado (peor): usar con umbrales más altos.
+
+    Retorna (odds_dict, son_reales, método).
+    """
+    # ── Nivel 1: ESPN tiempo real ─────────────────────────────────────────
+    if fixture_row is not None:
+        espn_odds = _get_espn_odds_from_fixture(fixture_row)
+        if espn_odds:
+            h_odds = espn_odds["home"]
+            d_odds = espn_odds["draw"]
+            a_odds = espn_odds["away"]
+            odds = {
+                "home_win":  h_odds,
+                "draw":      d_odds,
+                "away_win":  a_odds,
+                "btts_si":   CUOTAS_FALLBACK["btts_si"],
+                "btts_no":   CUOTAS_FALLBACK["btts_no"],
+                "over25":    espn_odds.get("over25")  or CUOTAS_FALLBACK["over25"],
+                "under25":   espn_odds.get("under25") or CUOTAS_FALLBACK["under25"],
+                "double_1x": _double_chance_odds(h_odds, d_odds),
+                "double_x2": _double_chance_odds(d_odds, a_odds),
+                "double_12": _double_chance_odds(h_odds, a_odds),
+            }
+            return odds, True, "espn_live"
+
+    # ── Nivel 2: Football-Data.co.uk histórico ───────────────────────────
+    real = None
+    if historical is not None and not historical.empty:
+        try:
+            real = get_current_season_odds(home_team, away_team, historical)
+        except Exception as e:
+            log.debug(f"Error cuotas históricas {home_team}: {e}")
+
+    if real:
+        h_odds = real["home"]
+        d_odds = real["draw"]
+        a_odds = real["away"]
+        odds = {
+            "home_win":  h_odds,
+            "draw":      d_odds,
+            "away_win":  a_odds,
+            "btts_si":   CUOTAS_FALLBACK["btts_si"],
+            "btts_no":   CUOTAS_FALLBACK["btts_no"],
+            "over25":    real.get("over25")  or CUOTAS_FALLBACK["over25"],
+            "under25":   real.get("under25") or CUOTAS_FALLBACK["under25"],
+            "double_1x": _double_chance_odds(h_odds, d_odds),
+            "double_x2": _double_chance_odds(d_odds, a_odds),
+            "double_12": _double_chance_odds(h_odds, a_odds),
+        }
+        return odds, True, real.get("method", "fd_historical")
+
+    # ── Nivel 3: Fallback estimado ────────────────────────────────────────
+    return CUOTAS_FALLBACK.copy(), False, "fallback"
 
 
 # ─── CÁLCULOS CORE ───────────────────────────────────────────────────────────
@@ -261,7 +321,7 @@ def kelly_fraction(model_prob: float, decimal_odds: float,
 
 def _double_chance_odds(odds_a: float, odds_b: float,
                         overround: float = 0.95) -> float:
-    if odds_a <= 1.0 or odds_b <= 1.0:
+    if not odds_a or not odds_b or odds_a <= 1.0 or odds_b <= 1.0:
         return 1.10
     fair_prob = (1 / odds_a) + (1 / odds_b)
     if fair_prob >= 1.0:
@@ -284,53 +344,41 @@ def get_model_prob_for_market(market: str, predictions: dict) -> float:
     return predictions.get(key, 0) if key else 0
 
 
-def build_odds_dict(home_team: str, away_team: str,
-                    historical: pd.DataFrame) -> tuple[dict, bool, str]:
-    """
-    Construye el diccionario de cuotas para un partido.
-    Retorna (odds_dict, son_reales, método).
-    """
-    real = None
-    if historical is not None and not historical.empty:
-        try:
-            real = get_current_season_odds(home_team, away_team, historical)
-        except Exception as e:
-            log.debug(f"Error obteniendo cuotas para {home_team}: {e}")
-
-    if real:
-        h_odds = real["home"]
-        d_odds = real["draw"]
-        a_odds = real["away"]
-        odds = {
-            "home_win":  h_odds,
-            "draw":      d_odds,
-            "away_win":  a_odds,
-            "btts_si":   CUOTAS_FALLBACK["btts_si"],
-            "btts_no":   CUOTAS_FALLBACK["btts_no"],
-            "over25":    real.get("over25")  or CUOTAS_FALLBACK["over25"],
-            "under25":   real.get("under25") or CUOTAS_FALLBACK["under25"],
-            "double_1x": _double_chance_odds(h_odds, d_odds),
-            "double_x2": _double_chance_odds(d_odds, a_odds),
-            "double_12": _double_chance_odds(h_odds, a_odds),
-        }
-        method = real.get("method", "real")
-        return odds, True, method
-
-    return CUOTAS_FALLBACK.copy(), False, "fallback"
-
-
 def classify_confidence(edge: float, model_prob: float,
-                        n_home: int, n_away: int) -> str | None:
-    if (edge >= UMBRAL_EDGE_ALTA and
+                        n_home: int, n_away: int,
+                        odds_method: str = "fd_historical") -> str | None:
+    """
+    Clasifica la confianza de una apuesta.
+
+    FIX v4: n_home y n_away deben ser n_matches_total (no el conteo de ventana).
+    Los umbrales de edge se elevan para ligas sin cuotas reales (fallback).
+    """
+    # Umbrales según calidad de cuotas
+    if odds_method == "espn_live":
+        # Cuotas en tiempo real — umbrales estándar
+        edge_alta  = UMBRAL_EDGE_ALTA
+        edge_media = UMBRAL_EDGE_MEDIA
+    elif odds_method in ("exact_match", "contextual_avg", "fd_historical"):
+        # Cuotas históricas reales — umbrales estándar
+        edge_alta  = UMBRAL_EDGE_ALTA
+        edge_media = UMBRAL_EDGE_MEDIA
+    else:
+        # Fallback estimado — umbrales más altos (más conservador)
+        edge_alta  = UMBRAL_EDGE_ALTA_ESPN
+        edge_media = UMBRAL_EDGE_MEDIA_ESPN
+
+    if (edge >= edge_alta and
         model_prob >= UMBRAL_PROB_ALTA and
         n_home >= MIN_PARTIDOS_ALTA and
         n_away >= MIN_PARTIDOS_ALTA):
         return "alta"
-    if (edge >= UMBRAL_EDGE_MEDIA and
+
+    if (edge >= edge_media and
         model_prob >= UMBRAL_PROB_MEDIA and
         n_home >= MIN_PARTIDOS_MEDIA and
         n_away >= MIN_PARTIDOS_MEDIA):
         return "media"
+
     return None
 
 
@@ -371,9 +419,9 @@ def _compute_edge_vs_market(model_prob: float,
                              fixture_row: pd.Series,
                              market: str) -> float | None:
     market_col = {
-        "home_win":  "market_prob_home",
-        "draw":      "market_prob_draw",
-        "away_win":  "market_prob_away",
+        "home_win": "market_prob_home",
+        "draw":     "market_prob_draw",
+        "away_win": "market_prob_away",
     }.get(market)
 
     if not market_col:
@@ -392,17 +440,19 @@ def analyze_fixture(fixture_row: pd.Series, predictions: dict,
                     historical: pd.DataFrame = None) -> list:
     home   = fixture_row.get("home_team", "")
     away   = fixture_row.get("away_team", "")
+
+    # FIX: usar n_matches_total para classify_confidence
     n_home = int(fixture_row.get("n_home_matches", 0))
     n_away = int(fixture_row.get("n_away_matches", 0))
 
     reference_odds, odds_are_real, odds_method = build_odds_dict(
-        home, away, historical
+        home, away, historical, fixture_row
     )
 
-    if not odds_are_real:
-        log.debug(f"{home} vs {away}: cuotas estimadas (sin datos reales)")
-    else:
-        log.debug(f"{home} vs {away}: cuotas reales (método={odds_method})")
+    log.debug(
+        f"{home} vs {away}: cuotas {odds_method} "
+        f"({'real' if odds_are_real else 'estimada'})"
+    )
 
     markets_to_check = ["home_win", "away_win", "btts_si", "over25"]
     if n_home >= MIN_PARTIDOS_ALTA and n_away >= MIN_PARTIDOS_ALTA:
@@ -416,9 +466,11 @@ def analyze_fixture(fixture_row: pd.Series, predictions: dict,
 
         odds       = reference_odds.get(market, CUOTAS_FALLBACK.get(market, 2.0))
         edge       = calculate_edge(model_prob, odds)
-        confidence = classify_confidence(edge, model_prob, n_home, n_away)
 
-        # Más conservador si las cuotas son estimadas
+        # FIX: pasar odds_method a classify_confidence para umbrales dinámicos
+        confidence = classify_confidence(edge, model_prob, n_home, n_away, odds_method)
+
+        # Descartar media si cuotas son fallback (sin datos de mercado reales)
         if not odds_are_real and confidence == "media":
             confidence = None
         if confidence is None:
@@ -455,6 +507,7 @@ def analyze_fixture(fixture_row: pd.Series, predictions: dict,
             "model_prob_pct":  f"{model_prob*100:.1f}%",
             "reference_odds":  odds,
             "odds_source":     odds_method,
+            "odds_are_real":   odds_are_real,
             "edge_pct":        edge,
             "edge_vs_market":  edge_vs_market,
             "kelly_pct":       kelly,
@@ -512,9 +565,10 @@ def summarize_bets(bets_df: pd.DataFrame) -> dict:
         "edge_avg": round(bets_df["edge_pct"].mean(), 2),
     }
     if "odds_source" in bets_df.columns:
-        real_count = len(bets_df[~bets_df["odds_source"].isin(["fallback", "estimada"])])
+        for method in ["espn_live", "exact_match", "contextual_avg", "fallback"]:
+            count = len(bets_df[bets_df["odds_source"] == method])
+            if count:
+                result[f"odds_{method}"] = count
+        real_count = len(bets_df[bets_df.get("odds_are_real", False) == True])  # noqa
         result["real_odds_pct"] = round(real_count / len(bets_df) * 100, 1)
-        # Desglose por método
-        for method, group in bets_df.groupby("odds_source"):
-            result[f"odds_{method}"] = len(group)
     return result

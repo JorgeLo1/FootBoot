@@ -10,7 +10,7 @@ TELEGRAM_TOKEN        = os.getenv("TELEGRAM_TOKEN",   "TU_BOT_TOKEN_AQUI")
 TELEGRAM_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID", "TU_CHAT_ID_AQUI")
 SUPABASE_URL          = os.getenv("SUPABASE_URL",     "TU_SUPABASE_URL_AQUI")
 SUPABASE_KEY          = os.getenv("SUPABASE_KEY",     "TU_SUPABASE_ANON_KEY_AQUI")
-API_FOOTBALL_KEY      = os.getenv("API_FOOTBALL_KEY", "")   # usado por pipeline nacional
+API_FOOTBALL_KEY      = os.getenv("API_FOOTBALL_KEY", "")
 
 # ─── TEMPORADA DINÁMICA ───────────────────────────────────────────────────────
 def current_season() -> int:
@@ -30,8 +30,8 @@ def _build_seasons(n: int = 5) -> list[str]:
 
 FOOTBALL_DATA_SEASONS = _build_seasons(5)
 
-# ─── LIGAS DE CLUBES ─────────────────────────────────────────────────────────
-# league_id (football-data.org) → (nombre, fd_code Football-Data.co.uk, fdorg_id)
+# ─── LIGAS EUROPEAS (football-data.org + Football-Data.co.uk) ────────────────
+# league_id → (nombre, fd_code Football-Data.co.uk, fdorg_id)
 LIGAS = {
     39:  ("Premier League", "E0", 2021),
     140: ("La Liga",        "SP1", 2014),
@@ -42,16 +42,62 @@ LIGAS = {
     94:  ("Primeira Liga",  "P1",  2017),
 }
 
-# ─── COMPETICIONES DE SELECCIONES NACIONALES (API-Football) ──────────────────
-# league_id → {nombre, temporada, tier}
-COMPETICIONES_NACIONALES = {
-    361: {"nombre": "Eliminatorias CONMEBOL", "temporada": 2026, "tier": 1},
-    271: {"nombre": "Copa América",           "temporada": 2024, "tier": 1},
-    1:   {"nombre": "Copa del Mundo",         "temporada": 2026, "tier": 1},
+# ─── LIGAS ESPN (sin API key) ─────────────────────────────────────────────────
+# slug_espn → (league_id_interno, nombre_display)
+# league_id_interno: rangos 500+ para no colisionar con LIGAS ni COMPETICIONES_NACIONALES
+LIGAS_ESPN: dict[str, tuple[int, str]] = {
+    # Sudamérica — clubes
+    "col.1":                 (501, "Liga BetPlay"),
+    "arg.1":                 (502, "Liga Profesional Argentina"),
+    "bra.1":                 (503, "Brasileirão Serie A"),
+    "chi.1":                 (504, "Primera División Chile"),
+    "per.1":                 (505, "Liga 1 Perú"),
+    "ecu.1":                 (506, "LigaPro Ecuador"),
+    "uru.1":                 (507, "Liga AUF Uruguay"),
+    "par.1":                 (508, "Primera División Paraguay"),
+    "bol.1":                 (509, "Liga Profesional Bolivia"),
+    "ven.1":                 (510, "Primera División Venezuela"),
+    # Sudamérica — copas
+    "conmebol.libertadores": (511, "Copa Libertadores"),
+    "conmebol.sudamericana": (512, "Copa Sudamericana"),
+    "conmebol.recopa":       (513, "Recopa Sudamericana"),
+    # Europa — backup / ampliación
+    "uefa.champions":        (514, "Champions League"),
+    "uefa.europa":           (515, "Europa League"),
+    "uefa.europa.conf":      (516, "Conference League"),
+    # CONCACAF
+    "concacaf.champions":    (517, "Concacaf Champions Cup"),
+    "mex.1":                 (518, "Liga MX"),
+    "usa.1":                 (519, "MLS"),
 }
 
-# IDs de ligas oficiales de selecciones (no amistosos)
-TIER_1_NATIONAL_LEAGUES = {361, 271, 1, 4, 5}
+# Slugs activos para predicciones diarias
+# (los que tienen volumen suficiente de partidos para entrenar el modelo)
+LIGAS_ESPN_ACTIVAS: set[str] = {
+    "col.1",
+    "arg.1",
+    "bra.1",
+    "conmebol.libertadores",
+    "conmebol.sudamericana",
+    "uefa.champions",
+    "mex.1",
+}
+
+# ─── COMPETICIONES DE SELECCIONES NACIONALES ─────────────────────────────────
+# slug_espn → (league_id_interno, nombre_display)
+COMPETICIONES_NACIONALES_ESPN: dict[str, tuple[int, str]] = {
+    "fifa.worldq.conmebol": (361, "Eliminatorias CONMEBOL"),
+    "conmebol.america":     (271, "Copa América"),
+    "fifa.world":           (1,   "Copa del Mundo"),
+    "uefa.nations":         (5,   "UEFA Nations League"),
+    "concacaf.gold":        (30,  "Gold Cup"),
+    "fifa.worldq.uefa":     (600, "Eliminatorias UEFA"),
+    "fifa.worldq.concacaf": (601, "Eliminatorias CONCACAF"),
+    "caf.nations":          (602, "Copa África de Naciones"),
+}
+
+# IDs tier-1 de selecciones (competiciones oficiales, no amistosos)
+TIER_1_NATIONAL_LEAGUES: set[int] = {361, 271, 1, 4, 5, 30, 600, 601}
 
 # ─── UMBRALES DE CONFIANZA ────────────────────────────────────────────────────
 UMBRAL_EDGE_ALTA   = 8.0
@@ -65,6 +111,10 @@ KELLY_FRACCION     = 0.25
 # Umbrales más bajos para selecciones (menos partidos disponibles)
 MIN_PARTIDOS_ALTA_NACIONAL  = 15
 MIN_PARTIDOS_MEDIA_NACIONAL = 8
+
+# Umbrales para ligas ESPN sin cuotas reales (más conservador)
+UMBRAL_EDGE_ALTA_ESPN  = 10.0
+UMBRAL_EDGE_MEDIA_ESPN =  6.0
 
 # ─── MODELO ───────────────────────────────────────────────────────────────────
 VENTANA_FORMA          = 10
@@ -95,3 +145,8 @@ FOOTBALL_DATA_URL     = "https://www.football-data.co.uk/mmz4281"
 FOOTBALL_DATA_ORG_URL = "https://api.football-data.org/v4"
 OPENMETEO_URL         = "https://api.open-meteo.com/v1/forecast"
 CLUBELO_URL           = "http://api.clubelo.com"
+
+# ESPN API base URLs
+ESPN_SITE_V2  = "https://site.api.espn.com/apis/site/v2/sports/soccer"
+ESPN_SITE_V2B = "https://site.api.espn.com/apis/v2/sports/soccer"       # standings (fix)
+ESPN_CORE_V2  = "https://sports.core.api.espn.com/v2/sports/soccer/leagues"

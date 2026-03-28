@@ -2,17 +2,15 @@
 _02_feature_builder.py
 Construye todas las variables predictivas para cada partido.
 
-CAMBIOS v3:
-  1. normalize_team_name usa rapidfuzz para matching robusto en lugar de
-     un diccionario hardcodeado. Fallback a limpieza básica si rapidfuzz
-     no está instalado.
-  2. TeamNameResolver construye un vocabulario canónico desde los datos
-     históricos reales y resuelve nombres de la API contra ese vocabulario.
-     Esto elimina el problema silencioso de equipos sin histórico por
-     diferencias de nombre entre fuentes.
-  3. build_training_dataset: el feature market_prob_* se excluye del
-     training set (data leakage) y se añade solo en inferencia.
-  4. build_training_dataset: optimización O(n log n) via índice por equipo.
+CAMBIOS v4:
+  1. load_historical_results fusiona Football-Data.co.uk (EU, con cuotas)
+     con ESPN histórico (ligas sin cobertura EU, sin cuotas).
+  2. normalize_team_name usa rapidfuzz para matching robusto.
+  3. TeamNameResolver construye vocabulario canónico desde datos históricos
+     de AMBAS fuentes, resolviendo diferencias de nombre entre APIs.
+  4. build_training_dataset excluye market_prob_* (data leakage fix).
+  5. build_features_for_fixtures enriquece con cuotas ESPN en tiempo real
+     si el fixture viene de una liga ESPN y las cuotas están disponibles.
 """
 
 import os
@@ -47,7 +45,6 @@ except ImportError:
         "Instala con: pip install rapidfuzz"
     )
 
-# Prefijos y sufijos comunes a eliminar antes del matching
 _STRIP_TOKENS = [
     "fc", "cf", "ac", "sc", "rc", "cd", "sd", "ud", "rcd", "real",
     "atletico", "athletic", "sporting", "deportivo",
@@ -55,17 +52,14 @@ _STRIP_TOKENS = [
     "saint", "st", "borussia", "bayer", "rb", "ss", "as",
 ]
 
-# Umbral de similaridad mínimo para aceptar un match fuzzy
 _FUZZY_THRESHOLD = 82
 
 
 def _clean_name(name: str) -> str:
-    """Limpieza básica: minúsculas, sin puntuación, sin prefijos comunes."""
     import re
     s = name.lower().strip()
     s = re.sub(r"['\-\.]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    # Eliminar tokens genéricos solo si no es el nombre completo
     tokens = s.split()
     if len(tokens) > 1:
         tokens = [t for t in tokens if t not in _STRIP_TOKENS]
@@ -74,23 +68,16 @@ def _clean_name(name: str) -> str:
 
 class TeamNameResolver:
     """
-    Construye un vocabulario canónico de nombres de equipo a partir de los
-    datos históricos (Football-Data.co.uk) y resuelve nombres externos
-    (football-data.org, StatsBomb) contra ese vocabulario usando fuzzy matching.
-
-    Uso:
-        resolver = TeamNameResolver()
-        resolver.build_from_historical(historical_df)
-        canonical = resolver.resolve("Manchester City FC")  # → "man city"
+    Resuelve nombres de equipos de distintas fuentes (fd.org, ESPN, StatsBomb)
+    contra un vocabulario canónico construido desde los datos históricos.
     """
 
     def __init__(self):
-        self._canonical: list[str] = []          # nombres canónicos (ya normalizados)
-        self._raw_to_canonical: dict[str, str] = {}  # caché de resoluciones
+        self._canonical: list[str] = []
+        self._raw_to_canonical: dict[str, str] = {}
         self._built = False
 
     def build_from_historical(self, historical: pd.DataFrame):
-        """Extrae todos los nombres únicos del histórico como vocabulario canónico."""
         if historical.empty:
             log.warning("TeamNameResolver: histórico vacío, sin vocabulario.")
             return
@@ -106,26 +93,18 @@ class TeamNameResolver:
         log.info(f"TeamNameResolver: {len(self._canonical)} equipos en vocabulario.")
 
     def resolve(self, name: str) -> str:
-        """
-        Resuelve un nombre externo al nombre canónico más cercano.
-        Primero busca en caché; si no, intenta fuzzy match; si falla, devuelve
-        la versión limpiada del nombre original.
-        """
         if not name:
             return ""
 
-        # 1. Caché
         if name in self._raw_to_canonical:
             return self._raw_to_canonical[name]
 
         cleaned = _clean_name(name)
 
-        # 2. Match exacto tras limpieza
         if cleaned in self._canonical:
             self._raw_to_canonical[name] = cleaned
             return cleaned
 
-        # 3. Fuzzy match
         if _HAS_RAPIDFUZZ and self._built and self._canonical:
             result = fuzz_process.extractOne(
                 cleaned,
@@ -139,7 +118,6 @@ class TeamNameResolver:
                 self._raw_to_canonical[name] = matched
                 return matched
 
-        # 4. Fallback: nombre limpiado sin match
         log.debug(f"Sin match para '{name}', usando nombre limpiado: '{cleaned}'")
         self._raw_to_canonical[name] = cleaned
         return cleaned
@@ -148,22 +126,16 @@ class TeamNameResolver:
         return series.apply(self.resolve)
 
 
-# Instancia global — se inicializa con build_from_historical() al cargar datos
 _resolver = TeamNameResolver()
 
 
 def normalize_team_name(name: str) -> str:
-    """
-    Punto de entrada público. Usa el resolver global si está construido,
-    o limpieza básica en caso contrario.
-    """
     if _resolver._built:
         return _resolver.resolve(name)
     return _clean_name(name)
 
 
 def init_resolver(historical: pd.DataFrame):
-    """Inicializa el resolver global con el histórico. Llamar antes del pipeline."""
     _resolver.build_from_historical(historical)
 
 
@@ -173,57 +145,124 @@ def exponential_weight(days_ago: float, lam: float = LAMBDA_DECAY) -> float:
     return np.exp(-lam * max(days_ago, 0))
 
 
-# ─── CARGA DE DATOS ───────────────────────────────────────────────────────────
+# ─── CARGA DE DATOS HISTÓRICOS (EU + ESPN fusionados) ────────────────────────
 
 def load_historical_results() -> pd.DataFrame:
-    frames = []
+    """
+    Carga y fusiona datos históricos de todas las fuentes:
+      1. Football-Data.co.uk (7 ligas EU) — incluye cuotas B365, Pinnacle
+      2. ESPN API (ligas activas no EU) — solo goles, sin cuotas históricas
+
+    El resolver de nombres se inicializa con el vocabulario combinado,
+    lo que permite fuzzy matching cross-fuente (ej: "Atlético Nacional"
+    en ESPN vs posibles variantes en otros datasets).
+    """
+    frames_eu = []
+
+    # ── Fuente 1: Football-Data.co.uk ────────────────────────────────────
     for _, (league_name, fd_code, _) in LIGAS.items():
         path = os.path.join(DATA_RAW, f"fd_{fd_code}.csv")
         if os.path.exists(path):
             df = pd.read_csv(path, encoding="latin-1", on_bad_lines="skip")
             df["fd_code"]     = fd_code
             df["league_name"] = league_name
-            frames.append(df)
+            df["source"]      = "fd_uk"
+            frames_eu.append(df)
 
-    if not frames:
-        log.warning("Sin datos Football-Data. Ejecuta primero _01_data_collector.")
+    if not frames_eu:
+        log.warning("Sin datos Football-Data.co.uk. Ejecuta primero _01_data_collector.")
+
+    raw_eu = pd.DataFrame()
+    if frames_eu:
+        raw_eu = pd.concat(frames_eu, ignore_index=True)
+        raw_eu = raw_eu.rename(columns={
+            "HomeTeam": "home_team", "AwayTeam": "away_team",
+            "FTHG":     "home_goals", "FTAG":    "away_goals",
+            "FTR":      "result",     "Date":    "date_str",
+        })
+
+        def parse_date(d):
+            for fmt in ("%d/%m/%y", "%d/%m/%Y"):
+                try:
+                    return datetime.strptime(str(d), fmt)
+                except Exception:
+                    continue
+            return pd.NaT
+
+        raw_eu["match_date"] = raw_eu["date_str"].apply(parse_date)
+        raw_eu = raw_eu.dropna(subset=["match_date", "home_goals", "away_goals"])
+        raw_eu["home_goals"] = pd.to_numeric(raw_eu["home_goals"], errors="coerce")
+        raw_eu["away_goals"] = pd.to_numeric(raw_eu["away_goals"], errors="coerce")
+        raw_eu = raw_eu.dropna(subset=["home_goals", "away_goals"])
+
+        for col in ["B365H", "B365D", "B365A", "PSH", "PSD", "PSA",
+                    "B365>2.5", "B365<2.5"]:
+            if col in raw_eu.columns:
+                raw_eu[col] = pd.to_numeric(raw_eu[col], errors="coerce")
+
+    # ── Fuente 2: ESPN histórico ──────────────────────────────────────────
+    raw_espn = pd.DataFrame()
+    try:
+        from src._01_data_collector import load_espn_historical
+        raw_espn = load_espn_historical()
+
+        if not raw_espn.empty:
+            # Añadir columnas de cuotas vacías para schema unificado
+            for col in ["B365H", "B365D", "B365A", "PSH", "PSD", "PSA",
+                        "B365>2.5", "B365<2.5"]:
+                if col not in raw_espn.columns:
+                    raw_espn[col] = np.nan
+            # Asegurar columna date_str para compatibilidad
+            if "date_str" not in raw_espn.columns:
+                raw_espn["date_str"] = raw_espn["match_date"].astype(str)
+
+            log.info(f"ESPN histórico disponible: {len(raw_espn)} partidos")
+    except Exception as e:
+        log.warning(f"No se pudo cargar ESPN histórico: {e}")
+
+    # ── Fusión ────────────────────────────────────────────────────────────
+    if not raw_eu.empty and not raw_espn.empty:
+        # Alinear columnas comunes antes de concat
+        common_cols = ["home_team", "away_team", "home_goals", "away_goals",
+                       "match_date", "league_name", "source",
+                       "B365H", "B365D", "B365A", "PSH", "PSD", "PSA",
+                       "B365>2.5", "B365<2.5"]
+        for col in common_cols:
+            if col not in raw_eu.columns:
+                raw_eu[col] = np.nan
+            if col not in raw_espn.columns:
+                raw_espn[col] = np.nan
+
+        raw = pd.concat(
+            [raw_eu[common_cols + [c for c in raw_eu.columns if c not in common_cols]],
+             raw_espn[common_cols + [c for c in raw_espn.columns if c not in common_cols]]],
+            ignore_index=True
+        )
+    elif not raw_eu.empty:
+        raw = raw_eu
+    elif not raw_espn.empty:
+        raw = raw_espn
+    else:
+        log.error("Sin datos históricos de ninguna fuente.")
         return pd.DataFrame()
 
-    raw = pd.concat(frames, ignore_index=True)
-    raw = raw.rename(columns={
-        "HomeTeam": "home_team", "AwayTeam": "away_team",
-        "FTHG":     "home_goals", "FTAG":    "away_goals",
-        "FTR":      "result",     "Date":    "date_str",
-    })
-
-    def parse_date(d):
-        for fmt in ("%d/%m/%y", "%d/%m/%Y"):
-            try:
-                return datetime.strptime(str(d), fmt)
-            except Exception:
-                continue
-        return pd.NaT
-
-    raw["match_date"] = raw["date_str"].apply(parse_date)
+    # ── Normalización final ───────────────────────────────────────────────
+    raw["match_date"] = pd.to_datetime(raw["match_date"], errors="coerce")
     raw = raw.dropna(subset=["match_date", "home_goals", "away_goals"])
-    raw["home_goals"] = pd.to_numeric(raw["home_goals"], errors="coerce")
-    raw["away_goals"] = pd.to_numeric(raw["away_goals"], errors="coerce")
-    raw = raw.dropna(subset=["home_goals", "away_goals"])
+    raw = raw.sort_values("match_date").reset_index(drop=True)
 
-    # Inicializar resolver con nombres canónicos del histórico
+    # Inicializar resolver con vocabulario combinado
     init_resolver(raw)
 
-    # Normalizar usando el resolver ya construido
     raw["home_team_norm"] = raw["home_team"].apply(normalize_team_name)
     raw["away_team_norm"] = raw["away_team"].apply(normalize_team_name)
 
-    for col in ["B365H", "B365D", "B365A", "PSH", "PSD", "PSA",
-                "B365>2.5", "B365<2.5"]:
-        if col in raw.columns:
-            raw[col] = pd.to_numeric(raw[col], errors="coerce")
-
-    log.info(f"Datos históricos cargados: {len(raw)} partidos")
-    return raw.sort_values("match_date").reset_index(drop=True)
+    log.info(
+        f"Histórico total: {len(raw)} partidos "
+        f"(EU: {len(raw_eu) if not raw_eu.empty else 0} | "
+        f"ESPN: {len(raw_espn) if not raw_espn.empty else 0})"
+    )
+    return raw
 
 
 def load_xg_data() -> pd.DataFrame:
@@ -393,7 +432,7 @@ def compute_team_stats(team: str, is_home: bool,
         f"{p}_fouls_avg":       round(fouls_avg,     2),
         f"{p}_days_rest":       days_rest,
         f"{p}_n_matches":       len(df),
-        f"{p}_n_matches_total": n_total,
+        f"{p}_n_matches_total": n_total,   # ← FIX: este es el que usa classify_confidence
     }
 
 
@@ -493,7 +532,14 @@ def _extract_market_features(home: str, away: str,
 
 # ─── BUILDER PRINCIPAL ───────────────────────────────────────────────────────
 
-def build_features_for_fixtures(fixtures: pd.DataFrame) -> pd.DataFrame:
+def build_features_for_fixtures(fixtures: pd.DataFrame,
+                                 espn_client=None) -> pd.DataFrame:
+    """
+    Construye features para todos los fixtures del día.
+
+    espn_client: si se pasa, enriquece fixtures de ligas ESPN con cuotas
+    en tiempo real desde el Core API (/odds).
+    """
     log.info("Cargando datos históricos para feature building...")
     historical    = load_historical_results()
     xg_data       = load_xg_data()
@@ -504,6 +550,15 @@ def build_features_for_fixtures(fixtures: pd.DataFrame) -> pd.DataFrame:
         log.error("Sin datos históricos. Imposible calcular features.")
         return pd.DataFrame()
 
+    # Enriquecer fixtures con cuotas ESPN en tiempo real
+    if espn_client is not None and not fixtures.empty:
+        try:
+            from src.espn_collector import enrich_fixtures_with_odds
+            fixtures = enrich_fixtures_with_odds(espn_client, fixtures)
+            log.info("Fixtures enriquecidos con cuotas ESPN en tiempo real")
+        except Exception as e:
+            log.warning(f"No se pudo enriquecer con cuotas ESPN: {e}")
+
     ref_date     = datetime.now()
     all_features = []
 
@@ -511,7 +566,6 @@ def build_features_for_fixtures(fixtures: pd.DataFrame) -> pd.DataFrame:
         home = fixture["home_team"]
         away = fixture["away_team"]
 
-        # Log de resolución de nombres para debugging
         home_norm = normalize_team_name(home)
         away_norm = normalize_team_name(away)
         if home_norm != home.lower().strip():
@@ -531,13 +585,14 @@ def build_features_for_fixtures(fixtures: pd.DataFrame) -> pd.DataFrame:
                         home, fixture.get("date", ref_date.isoformat()))
         market     = _extract_market_features(home, away, historical, ref_date)
 
-        all_features.append({
+        feature_row = {
             "fixture_id":      fixture.get("fixture_id", 0),
             "league_id":       fixture.get("league_id", 0),
             "league_name":     fixture.get("league_name", ""),
             "home_team":       home,
             "away_team":       away,
             "match_date":      fixture.get("date", str(ref_date.date())),
+            "source":          fixture.get("source", "fdorg"),
             "n_home_matches":  home_stats.get("home_n_matches_total", 0),
             "n_away_matches":  away_stats.get("away_n_matches_total", 0),
             "elo_diff":        elo_diff,
@@ -546,7 +601,19 @@ def build_features_for_fixtures(fixtures: pd.DataFrame) -> pd.DataFrame:
             **h2h,
             **weather,
             **market,
-        })
+        }
+
+        # Cuotas ESPN en tiempo real si están disponibles
+        if fixture.get("espn_odds_available"):
+            feature_row["espn_odds_home"]     = fixture.get("espn_odds_home")
+            feature_row["espn_odds_draw"]      = fixture.get("espn_odds_draw")
+            feature_row["espn_odds_away"]      = fixture.get("espn_odds_away")
+            feature_row["espn_odds_provider"]  = fixture.get("espn_odds_provider")
+            feature_row["espn_odds_available"] = True
+        else:
+            feature_row["espn_odds_available"] = False
+
+        all_features.append(feature_row)
 
     df = pd.DataFrame(all_features)
     if not df.empty:
@@ -573,8 +640,11 @@ def _add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
 # ─── DATASET DE ENTRENAMIENTO ────────────────────────────────────────────────
 
 def build_training_dataset(historical: pd.DataFrame) -> pd.DataFrame:
-    """Dataset walk-forward optimizado y sin data leakage."""
-    log.info("Construyendo dataset walk-forward (optimizado, sin leakage)...")
+    """
+    Dataset walk-forward sin data leakage.
+    Incluye partidos de ligas EU y ESPN para entrenamiento unificado.
+    """
+    log.info("Construyendo dataset walk-forward (sin leakage)...")
 
     xg_data       = load_xg_data()
     match_summary = load_match_summary()
