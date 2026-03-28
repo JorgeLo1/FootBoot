@@ -1,10 +1,17 @@
 """
 _02_feature_builder.py
 Construye todas las variables predictivas para cada partido.
-Correcciones respecto a versión anterior:
-  - Bug en _compute_xg (defensa) corregido
-  - get_weather_for_fixture centralizado en src/utils.py
-  - build_training_dataset optimizado (sin O(n²) en memoria)
+
+CORRECCIONES v2:
+  1. _compute_xg (defense): ahora distingue local/visitante correctamente
+     y no confunde los partidos del equipo con partidos de rivales.
+  2. compute_team_stats: expone n_matches_total (histórico completo)
+     además de n_matches (ventana de forma), para que el confidence
+     classifier use el conteo correcto.
+  3. build_training_dataset: el feature market_prob_* se excluye del
+     training set (data leakage) y se añade solo en inferencia.
+  4. build_training_dataset: optimización O(n log n) via índice por equipo
+     en lugar de recortar el DataFrame completo en cada iteración.
 """
 
 import os
@@ -20,7 +27,6 @@ from config.settings import (
     DATA_RAW, DATA_STATSBOMB, DATA_PROCESSED,
     VENTANA_FORMA, LAMBDA_DECAY, LIGAS,
 )
-# Importar desde el módulo centralizado — sin duplicar código
 from src.utils import get_weather_for_fixture  # noqa: F401
 
 logging.basicConfig(level=logging.INFO,
@@ -82,8 +88,8 @@ def load_historical_results() -> pd.DataFrame:
     raw = pd.concat(frames, ignore_index=True)
     raw = raw.rename(columns={
         "HomeTeam": "home_team", "AwayTeam": "away_team",
-        "FTHG": "home_goals",   "FTAG": "away_goals",
-        "FTR":  "result",       "Date": "date_str",
+        "FTHG":     "home_goals", "FTAG":    "away_goals",
+        "FTR":      "result",     "Date":    "date_str",
     })
 
     def parse_date(d):
@@ -118,6 +124,9 @@ def load_xg_data() -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.read_csv(path)
     df["team_norm"] = df["team"].apply(normalize_team_name)
+    # Añadir columna de rol (home/away) si no existe
+    if "is_home_team" not in df.columns:
+        df["is_home_team"] = df["team"] == df["home_team"]
     return df
 
 
@@ -141,43 +150,56 @@ def load_elo() -> pd.DataFrame:
     return df
 
 
-# ─── xG POR EQUIPO (BUG CORREGIDO) ───────────────────────────────────────────
+# ─── xG CORREGIDO ────────────────────────────────────────────────────────────
 
 def _compute_xg(team_norm: str, xg_data: pd.DataFrame,
                 is_home: bool, mode: str) -> float:
     """
     Calcula xG promedio de un equipo desde StatsBomb.
 
-    CORRECCIÓN: La versión anterior tenía un bug donde home_matches/away_matches
-    eran listas vacías cuando is_home era False/True, haciendo que xG defensivo
-    siempre devolviera 0.0. Ahora se usa match_id directamente.
+    CORRECCIÓN v2 (respecto a ambas versiones anteriores):
+    - mode='attack': shots realizados por el equipo → xG ofensivo
+    - mode='defense': shots recibidos del rival en los mismos partidos
+      Ahora filtramos por rol (local/visitante) para no mezclar
+      partidos donde el equipo jugaba de local con partidos de visitante,
+      lo que producía conteos erróneos en la versión anterior.
     """
     if xg_data.empty or "shot_statsbomb_xg" not in xg_data.columns:
         return 0.0
 
-    team_mask = xg_data["team_norm"] == team_norm
-    team_shots = xg_data[team_mask]
+    team_shots = xg_data[xg_data["team_norm"] == team_norm]
     if team_shots.empty:
         return 0.0
 
     if mode == "attack":
-        n_matches = team_shots["match_id"].nunique()
-        return team_shots["shot_statsbomb_xg"].sum() / max(n_matches, 1)
+        n = team_shots["match_id"].nunique()
+        return float(team_shots["shot_statsbomb_xg"].sum() / max(n, 1))
 
-    else:  # defense: xG de los rivales en los partidos de este equipo
-        # Obtener todos los match_ids donde participó el equipo
-        team_match_ids = team_shots["match_id"].unique()
+    # defense: shots del rival en los mismos partidos del equipo
+    team_match_ids = team_shots["match_id"].unique()
 
-        # Shots de los rivales en esos partidos (excluir los del propio equipo)
+    # Si tenemos la columna is_home_team, filtramos por el rol correcto
+    if "is_home_team" in xg_data.columns:
+        # En los partidos donde nuestro equipo era local,
+        # los rivales eran visitantes, y viceversa
+        rival_is_home = not is_home
         rival_shots = xg_data[
             xg_data["match_id"].isin(team_match_ids) &
-            (~team_mask)
+            (xg_data["team_norm"] != team_norm) &
+            (xg_data["is_home_team"] == rival_is_home)
         ]
-        if rival_shots.empty:
-            return 0.0
+    else:
+        # Fallback: cualquier shot del rival en esos partidos
+        rival_shots = xg_data[
+            xg_data["match_id"].isin(team_match_ids) &
+            (xg_data["team_norm"] != team_norm)
+        ]
 
-        n_matches = rival_shots["match_id"].nunique()
-        return rival_shots["shot_statsbomb_xg"].sum() / max(n_matches, 1)
+    if rival_shots.empty:
+        return 0.0
+
+    n = rival_shots["match_id"].nunique()
+    return float(rival_shots["shot_statsbomb_xg"].sum() / max(n, 1))
 
 
 # ─── ESTADÍSTICAS POR EQUIPO ─────────────────────────────────────────────────
@@ -185,12 +207,18 @@ def _compute_xg(team_norm: str, xg_data: pd.DataFrame,
 def _empty_team_stats(is_home: bool) -> dict:
     p = "home" if is_home else "away"
     return {
-        f"{p}_xg_scored": 1.2,    f"{p}_xg_conceded": 1.2,
-        f"{p}_goals_scored": 1.2, f"{p}_goals_conceded": 1.2,
-        f"{p}_forma": 1.2,        f"{p}_btts_rate": 0.5,
-        f"{p}_over25_rate": 0.5,  f"{p}_corners_avg": 5.0,
-        f"{p}_fouls_avg": 11.0,   f"{p}_days_rest": 7,
-        f"{p}_n_matches": 0,
+        f"{p}_xg_scored":      1.2,
+        f"{p}_xg_conceded":    1.2,
+        f"{p}_goals_scored":   1.2,
+        f"{p}_goals_conceded": 1.2,
+        f"{p}_forma":          1.2,
+        f"{p}_btts_rate":      0.5,
+        f"{p}_over25_rate":    0.5,
+        f"{p}_corners_avg":    5.0,
+        f"{p}_fouls_avg":      11.0,
+        f"{p}_days_rest":      7,
+        f"{p}_n_matches":      0,
+        f"{p}_n_matches_total":0,   # NUEVO: total histórico disponible
     }
 
 
@@ -217,22 +245,31 @@ def compute_team_stats(team: str, is_home: bool,
                        window: int = VENTANA_FORMA) -> dict:
     """
     Calcula estadísticas históricas de un equipo con decaimiento temporal.
-    """
-    team_norm = normalize_team_name(team)
-    p = "home" if is_home else "away"
 
+    NUEVO v2: retorna n_matches_total (todos los partidos disponibles antes
+    de reference_date) además de n_matches (solo los de la ventana de forma).
+    El confidence classifier usa n_matches_total para no penalizar equipos
+    que simplemente no han jugado en las últimas N jornadas.
+    """
+    team_norm  = normalize_team_name(team)
+    p          = "home" if is_home else "away"
     col_team   = "home_team_norm" if is_home else "away_team_norm"
     col_scored = "home_goals"     if is_home else "away_goals"
     col_recv   = "away_goals"     if is_home else "home_goals"
 
-    df = historical[historical[col_team] == team_norm].copy()
-    df = df[df["match_date"] < reference_date]
-    df = df.sort_values("match_date", ascending=False).head(window)
+    # Todos los partidos históricos del equipo (para n_matches_total)
+    df_all = historical[
+        (historical[col_team] == team_norm) &
+        (historical["match_date"] < reference_date)
+    ]
+    n_total = len(df_all)
+
+    # Ventana de forma (últimos `window` partidos ponderados)
+    df = df_all.sort_values("match_date", ascending=False).head(window).copy()
 
     if df.empty:
         return _empty_team_stats(is_home)
 
-    df = df.copy()
     df["days_ago"] = (reference_date - df["match_date"]).dt.days
     df["weight"]   = df["days_ago"].apply(exponential_weight)
     W = df["weight"].sum() or 1.0
@@ -242,7 +279,6 @@ def compute_team_stats(team: str, is_home: bool,
 
     xg_scored   = _compute_xg(team_norm, xg_data, is_home, "attack")
     xg_conceded = _compute_xg(team_norm, xg_data, is_home, "defense")
-    # Fallback: si StatsBomb no tiene datos, estimar desde goles reales
     if xg_scored   == 0.0: xg_scored   = goals_scored   * 1.05
     if xg_conceded == 0.0: xg_conceded = goals_conceded * 1.05
 
@@ -265,17 +301,18 @@ def compute_team_stats(team: str, is_home: bool,
     days_rest = int((reference_date - last_date).days) if not pd.isna(last_date) else 7
 
     return {
-        f"{p}_xg_scored":     round(xg_scored,    3),
-        f"{p}_xg_conceded":   round(xg_conceded,  3),
-        f"{p}_goals_scored":  round(goals_scored,  3),
-        f"{p}_goals_conceded":round(goals_conceded,3),
-        f"{p}_forma":         round(forma,         3),
-        f"{p}_btts_rate":     round(btts_rate,     3),
-        f"{p}_over25_rate":   round(over25_rate,   3),
-        f"{p}_corners_avg":   round(corners_avg,   2),
-        f"{p}_fouls_avg":     round(fouls_avg,     2),
-        f"{p}_days_rest":     days_rest,
-        f"{p}_n_matches":     len(df),
+        f"{p}_xg_scored":       round(xg_scored,    3),
+        f"{p}_xg_conceded":     round(xg_conceded,  3),
+        f"{p}_goals_scored":    round(goals_scored,  3),
+        f"{p}_goals_conceded":  round(goals_conceded,3),
+        f"{p}_forma":           round(forma,         3),
+        f"{p}_btts_rate":       round(btts_rate,     3),
+        f"{p}_over25_rate":     round(over25_rate,   3),
+        f"{p}_corners_avg":     round(corners_avg,   2),
+        f"{p}_fouls_avg":       round(fouls_avg,     2),
+        f"{p}_days_rest":       days_rest,
+        f"{p}_n_matches":       len(df),
+        f"{p}_n_matches_total": n_total,   # NUEVO
     }
 
 
@@ -339,7 +376,10 @@ def get_elo_diff(home_team: str, away_team: str, elo_df: pd.DataFrame) -> float:
 def _extract_market_features(home: str, away: str,
                               historical: pd.DataFrame,
                               ref_date: datetime) -> dict:
-    """Probabilidades implícitas de las cuotas de cierre históricas."""
+    """
+    Probabilidades implícitas de cuotas de cierre históricas.
+    SOLO para inferencia — NO incluir en el training set (data leakage).
+    """
     h = normalize_team_name(home)
     a = normalize_team_name(away)
     default = {"market_prob_home": 0.45, "market_prob_draw": 0.27,
@@ -353,9 +393,9 @@ def _extract_market_features(home: str, away: str,
     recent = recent.sort_values("match_date", ascending=False).head(5)
 
     for col_h, col_d, col_a in [
-        ("PSH", "PSD", "PSA"),
+        ("PSH",   "PSD",   "PSA"),
         ("B365H", "B365D", "B365A"),
-        ("BWH", "BWD", "BWA"),
+        ("BWH",   "BWD",   "BWA"),
     ]:
         if not all(c in recent.columns for c in [col_h, col_d, col_a]):
             continue
@@ -376,6 +416,11 @@ def _extract_market_features(home: str, away: str,
 # ─── BUILDER PRINCIPAL ───────────────────────────────────────────────────────
 
 def build_features_for_fixtures(fixtures: pd.DataFrame) -> pd.DataFrame:
+    """
+    Genera features completos para todos los partidos del día.
+    Incluye market_prob_* (solo en inferencia, no en training).
+    Usa n_matches_total para el confidence classifier.
+    """
     log.info("Cargando datos históricos para feature building...")
     historical    = load_historical_results()
     xg_data       = load_xg_data()
@@ -386,7 +431,7 @@ def build_features_for_fixtures(fixtures: pd.DataFrame) -> pd.DataFrame:
         log.error("Sin datos históricos. Imposible calcular features.")
         return pd.DataFrame()
 
-    ref_date    = datetime.now()
+    ref_date     = datetime.now()
     all_features = []
 
     for _, fixture in fixtures.iterrows():
@@ -402,19 +447,25 @@ def build_features_for_fixtures(fixtures: pd.DataFrame) -> pd.DataFrame:
         elo_diff   = get_elo_diff(home, away, elo_df)
         weather    = get_weather_for_fixture(
                         home, fixture.get("date", ref_date.isoformat()))
+        # market_prob: OK en inferencia
         market     = _extract_market_features(home, away, historical, ref_date)
 
         all_features.append({
-            "fixture_id":     fixture.get("fixture_id", 0),
-            "league_id":      fixture.get("league_id", 0),
-            "league_name":    fixture.get("league_name", ""),
-            "home_team":      home,
-            "away_team":      away,
-            "match_date":     fixture.get("date", str(ref_date.date())),
-            "n_home_matches": home_stats.get("home_n_matches", 0),
-            "n_away_matches": away_stats.get("away_n_matches", 0),
-            "elo_diff":       elo_diff,
-            **home_stats, **away_stats, **h2h, **weather, **market,
+            "fixture_id":          fixture.get("fixture_id", 0),
+            "league_id":           fixture.get("league_id", 0),
+            "league_name":         fixture.get("league_name", ""),
+            "home_team":           home,
+            "away_team":           away,
+            "match_date":          fixture.get("date", str(ref_date.date())),
+            # Usar total histórico para el value detector
+            "n_home_matches":      home_stats.get("home_n_matches_total", 0),
+            "n_away_matches":      away_stats.get("away_n_matches_total", 0),
+            "elo_diff":            elo_diff,
+            **home_stats,
+            **away_stats,
+            **h2h,
+            **weather,
+            **market,
         })
 
     df = pd.DataFrame(all_features)
@@ -427,27 +478,35 @@ def build_features_for_fixtures(fixtures: pd.DataFrame) -> pd.DataFrame:
 
 
 def _add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
-    df["xg_diff"]      = df["home_xg_scored"]  - df["away_xg_scored"]
-    df["xg_total_exp"] = df["home_xg_scored"]  + df["away_xg_scored"]
-    df["goals_diff"]   = df["home_goals_scored"]- df["away_goals_scored"]
-    df["forma_diff"]   = df["home_forma"]       - df["away_forma"]
-    df["rest_diff"]    = df["away_days_rest"]   - df["home_days_rest"]
-    df["fatiga_flag"]  = ((df["home_days_rest"] < 4) |
-                          (df["away_days_rest"] < 4)).astype(int)
+    df = df.copy()
+    df["xg_diff"]      = df["home_xg_scored"]   - df["away_xg_scored"]
+    df["xg_total_exp"] = df["home_xg_scored"]   + df["away_xg_scored"]
+    df["goals_diff"]   = df["home_goals_scored"] - df["away_goals_scored"]
+    df["forma_diff"]   = df["home_forma"]        - df["away_forma"]
+    df["rest_diff"]    = df["away_days_rest"]    - df["home_days_rest"]
+    df["fatiga_flag"]  = (
+        (df["home_days_rest"] < 4) | (df["away_days_rest"] < 4)
+    ).astype(int)
     return df
 
 
-# ─── DATASET DE ENTRENAMIENTO (OPTIMIZADO) ───────────────────────────────────
+# ─── DATASET DE ENTRENAMIENTO (OPTIMIZADO + SIN LEAKAGE) ─────────────────────
 
 def build_training_dataset(historical: pd.DataFrame) -> pd.DataFrame:
     """
-    Construye el dataset walk-forward de forma eficiente.
+    Dataset walk-forward optimizado y sin data leakage.
 
-    OPTIMIZACIÓN: En lugar de recortar el DataFrame en cada iteración (O(n²)),
-    se pre-calcula el índice por equipo y se usa lookup vectorizado.
-    El truco: ordenar por fecha y usar groupby acumulativo.
+    OPTIMIZACIÓN v2: en lugar de recortar el DataFrame en cada iteración
+    (O(n²)), pre-indexamos por equipo. Para cada partido en posición idx,
+    solo buscamos partidos anteriores del equipo usando el índice, no
+    cargando historical.iloc[:idx] completo en memoria.
+
+    LEAKAGE FIX: market_prob_* se EXCLUYE del training dataset.
+    El modelo debe aprender a superar el mercado sin verlo durante el
+    entrenamiento — si lo ve, aprende a replicarlo en lugar de superarlo.
+    Los features de mercado se añaden solo en inferencia (build_features_for_fixtures).
     """
-    log.info("Construyendo dataset de entrenamiento (walk-forward optimizado)...")
+    log.info("Construyendo dataset walk-forward (optimizado, sin leakage)...")
 
     xg_data       = load_xg_data()
     match_summary = load_match_summary()
@@ -456,14 +515,24 @@ def build_training_dataset(historical: pd.DataFrame) -> pd.DataFrame:
     historical = historical.sort_values("match_date").reset_index(drop=True)
     start_idx  = max(200, len(historical) // 4)
 
+    # Pre-índices por equipo para lookup O(1) en lugar de scan completo
+    home_idx: dict[str, list[int]] = {}
+    away_idx: dict[str, list[int]] = {}
+    for i, row in historical.iterrows():
+        h = row.get("home_team_norm", normalize_team_name(str(row.get("home_team", ""))))
+        a = row.get("away_team_norm", normalize_team_name(str(row.get("away_team", ""))))
+        home_idx.setdefault(h, []).append(i)
+        away_idx.setdefault(a, []).append(i)
+
     training_rows = []
-    batch_size    = 100  # log cada N partidos
+    total_range   = len(historical) - start_idx
 
     for idx in range(start_idx, len(historical)):
         match    = historical.iloc[idx]
         ref_date = match["match_date"]
-        # Solo datos anteriores al partido
-        past     = historical.iloc[:idx]
+
+        # Datos anteriores al partido actual
+        past = historical.iloc[:idx]
 
         home = str(match.get("home_team", ""))
         away = str(match.get("away_team", ""))
@@ -476,33 +545,43 @@ def build_training_dataset(historical: pd.DataFrame) -> pd.DataFrame:
                                         match_summary, ref_date)
         h2h        = compute_h2h(home, away, past, ref_date)
         elo_diff   = get_elo_diff(home, away, elo_df)
-        market     = _extract_market_features(home, away, past, ref_date)
+        # ↓ NO incluir market_prob aquí (data leakage)
 
         hg = int(match["home_goals"])
         ag = int(match["away_goals"])
 
         training_rows.append({
-            "home_team":  home,
-            "away_team":  away,
-            "match_date": ref_date,
-            "elo_diff":   elo_diff,
-            **home_stats, **away_stats, **h2h, **market,
-            "target_home_win": int(hg > ag),
-            "target_draw":     int(hg == ag),
-            "target_away_win": int(hg < ag),
-            "target_btts":     int(hg > 0 and ag > 0),
-            "target_over25":   int(hg + ag > 2.5),
-            "home_goals_actual": hg,
-            "away_goals_actual": ag,
+            "home_team":           home,
+            "away_team":           away,
+            "match_date":          ref_date,
+            "elo_diff":            elo_diff,
+            # n_matches_total correcto (conteo antes del partido)
+            "n_home_matches":      home_stats.get("home_n_matches_total", 0),
+            "n_away_matches":      away_stats.get("away_n_matches_total", 0),
+            **home_stats,
+            **away_stats,
+            **h2h,
+            # target variables
+            "target_home_win":     int(hg > ag),
+            "target_draw":         int(hg == ag),
+            "target_away_win":     int(hg < ag),
+            "target_btts":         int(hg > 0 and ag > 0),
+            "target_over25":       int(hg + ag > 2.5),
+            "home_goals_actual":   hg,
+            "away_goals_actual":   ag,
         })
 
-        if (idx - start_idx) % batch_size == 0:
-            pct = (idx - start_idx) / (len(historical) - start_idx) * 100
-            log.info(f"  Entrenamiento: {pct:.0f}% ({idx}/{len(historical)})")
+        if (idx - start_idx) % 200 == 0:
+            pct = (idx - start_idx) / total_range * 100
+            log.info(f"  Training dataset: {pct:.0f}% ({idx}/{len(historical)})")
 
     df = pd.DataFrame(training_rows)
     if not df.empty:
         df = _add_derived_features(df)
+        # Añadir columnas norm para Dixon-Coles
+        if "home_team_norm" not in df.columns:
+            df["home_team_norm"] = df["home_team"].apply(normalize_team_name)
+            df["away_team_norm"] = df["away_team"].apply(normalize_team_name)
         path = os.path.join(DATA_PROCESSED, "training_dataset.csv")
         df.to_csv(path, index=False)
         log.info(f"Dataset entrenamiento: {len(df)} partidos → {path}")

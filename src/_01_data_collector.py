@@ -39,71 +39,53 @@ rate_limiter = ApiRateLimiter(API_USAGE_FILE, API_FOOTBALL_DAILY_LIMIT)
 # ─── FIXTURES DEL DÍA ────────────────────────────────────────────────────────
 
 def get_fixtures_today() -> pd.DataFrame:
-    """
-    Obtiene los partidos del día desde API-Football.
-    Usa el rate limiter para no superar las 100 req/día del free tier.
-    """
-    needed = len(LIGAS)  # 1 request por liga
-    if not rate_limiter.can_request(needed):
-        log.error(
-            f"Rate limit alcanzado. {rate_limiter.status()}. "
-            "No se pueden obtener fixtures."
-        )
-        # Intentar recuperar el CSV del día si ya existe
-        today = date.today().strftime("%Y-%m-%d")
-        path  = os.path.join(DATA_RAW, f"fixtures_{today}.csv")
-        if os.path.exists(path):
-            log.info("Usando fixtures en caché del día.")
-            return pd.read_csv(path)
-        return pd.DataFrame()
-
     today = date.today().strftime("%Y-%m-%d")
-    url   = "https://v3.football.api-sports.io/fixtures"
-    headers = {
-        "x-rapidapi-host": "v3.football.api-sports.io",
-        "x-rapidapi-key":  API_FOOTBALL_KEY,
+    headers = {"X-Auth-Token": FOOTBALL_DATA_ORG_KEY}
+    
+    # IDs de football-data.org (distintos a API-Football)
+    COMPETITION_IDS = {
+        2021: ("Premier League",  39),
+        2014: ("La Liga",        140),
+        2002: ("Bundesliga",      78),
+        2019: ("Serie A",        135),
+        2015: ("Ligue 1",         61),
+        2003: ("Eredivisie",      88),
+        2017: ("Primeira Liga",   94),
     }
-
+    
     all_fixtures = []
-    for league_id, (league_name, _) in LIGAS.items():
+    for comp_id, (league_name, league_id) in COMPETITION_IDS.items():
         try:
             resp = requests.get(
-                url,
+                f"https://api.football-data.org/v4/competitions/{comp_id}/matches",
                 headers=headers,
-                params={"date": today, "league": league_id,
-                        "season": CURRENT_SEASON},
+                params={"dateFrom": today, "dateTo": today},
                 timeout=10,
             )
             resp.raise_for_status()
-            rate_limiter.consume(1)
-            data = resp.json()
-
-            for f in data.get("response", []):
-                fixture = f["fixture"]
-                teams   = f["teams"]
+            
+            for match in resp.json().get("matches", []):
                 all_fixtures.append({
-                    "fixture_id":  fixture["id"],
-                    "date":        fixture["date"],
+                    "fixture_id":  match["id"],
+                    "date":        match["utcDate"],
                     "league_id":   league_id,
                     "league_name": league_name,
-                    "home_team":   teams["home"]["name"],
-                    "away_team":   teams["away"]["name"],
-                    "venue":       fixture.get("venue", {}).get("name", ""),
-                    "venue_city":  fixture.get("venue", {}).get("city", ""),
-                    "status":      fixture["status"]["short"],
+                    "home_team":   match["homeTeam"]["name"],
+                    "away_team":   match["awayTeam"]["name"],
+                    "venue":       "",
+                    "venue_city":  "",
+                    "status":      match["status"],
                 })
+            time.sleep(6)  # respetar 10 req/min
+            
         except Exception as e:
-            log.warning(f"Error obteniendo fixtures {league_name}: {e}")
-
-    log.info(rate_limiter.status())
-
+            log.warning(f"Error fixtures {league_name}: {e}")
+    
     df = pd.DataFrame(all_fixtures)
     if not df.empty:
         path = os.path.join(DATA_RAW, f"fixtures_{today}.csv")
         df.to_csv(path, index=False)
-        log.info(f"Fixtures guardados: {len(df)} partidos → {path}")
-    else:
-        log.info("No hay partidos hoy en las ligas activas.")
+        log.info(f"Fixtures guardados: {len(df)} partidos")
     return df
 
 

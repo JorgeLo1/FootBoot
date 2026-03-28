@@ -1,7 +1,10 @@
 """
 utils.py
 Utilidades compartidas: clima, rate-limiting de API, normalización.
-Centraliza código que antes estaba duplicado en 3 módulos distintos.
+
+CAMBIOS v2:
+  - ApiRateLimiter.consume() dispara alerta Telegram si quedan < 20 requests
+  - get_weather_for_fixture maneja mejor el caso de datetime ya date
 """
 
 import os
@@ -45,28 +48,38 @@ ESTADIOS: dict[str, tuple[float, float]] = {
 }
 DEFAULT_COORDS = (51.5074, -0.1278)  # Londres como fallback
 
+# Umbral de alerta de requests restantes
+API_ALERT_THRESHOLD = 20
 
-def get_weather_for_fixture(home_team: str, match_datetime: str) -> dict:
+
+def get_weather_for_fixture(home_team: str, match_datetime) -> dict:
     """
     Obtiene pronóstico del clima para un partido usando Open-Meteo (sin API key).
-    Retorna dict con temperatura, lluvia y viento.
+    Acepta match_datetime como str ISO o como objeto date/datetime.
     """
     from config.settings import OPENMETEO_URL
 
-    coords = ESTADIOS.get(home_team, DEFAULT_COORDS)
+    coords   = ESTADIOS.get(home_team, DEFAULT_COORDS)
     lat, lon = coords
 
+    # Normalizar match_datetime a string de fecha
     try:
-        dt = datetime.fromisoformat(str(match_datetime).replace("Z", "+00:00"))
-        ds = dt.strftime("%Y-%m-%d")
+        if isinstance(match_datetime, (date, datetime)):
+            ds = match_datetime.strftime("%Y-%m-%d")
+        else:
+            dt = datetime.fromisoformat(str(match_datetime).replace("Z", "+00:00"))
+            ds = dt.strftime("%Y-%m-%d")
+    except Exception:
+        ds = date.today().strftime("%Y-%m-%d")
 
+    try:
         r = requests.get(
             OPENMETEO_URL,
             params={
                 "latitude":    lat,
                 "longitude":   lon,
                 "timezone":    "auto",
-                "daily": "precipitation_sum,windspeed_10m_max,temperature_2m_max",
+                "daily":       "precipitation_sum,windspeed_10m_max,temperature_2m_max",
                 "forecast_days": 3,
                 "start_date":  ds,
                 "end_date":    ds,
@@ -74,7 +87,7 @@ def get_weather_for_fixture(home_team: str, match_datetime: str) -> dict:
             timeout=8,
         )
         r.raise_for_status()
-        d = r.json().get("daily", {})
+        d    = r.json().get("daily", {})
         prec = (d.get("precipitation_sum") or [0])[0] or 0
         wind = (d.get("windspeed_10m_max") or [10])[0] or 10
         temp = (d.get("temperature_2m_max") or [15])[0] or 15
@@ -97,11 +110,16 @@ class ApiRateLimiter:
     """
     Trackea el uso diario de la API de Football (free tier: 100 req/día).
     Persiste el contador en JSON para sobrevivir entre ejecuciones del cron.
+
+    NUEVO: dispara alerta Telegram si los requests restantes caen por debajo
+    de API_ALERT_THRESHOLD (20 por defecto).
     """
+
     def __init__(self, usage_file: str, daily_limit: int = 100):
         self.usage_file  = usage_file
         self.daily_limit = daily_limit
         self._state      = self._load()
+        self._alerted    = False  # evitar spam de alertas en la misma ejecución
 
     def _load(self) -> dict:
         today = str(date.today())
@@ -109,7 +127,6 @@ class ApiRateLimiter:
             if os.path.exists(self.usage_file):
                 with open(self.usage_file) as f:
                     state = json.load(f)
-                # Resetear si es un día nuevo
                 if state.get("date") != today:
                     return {"date": today, "count": 0}
                 return state
@@ -119,8 +136,11 @@ class ApiRateLimiter:
 
     def _save(self):
         os.makedirs(os.path.dirname(self.usage_file), exist_ok=True)
-        with open(self.usage_file, "w") as f:
-            json.dump(self._state, f)
+        try:
+            with open(self.usage_file, "w") as f:
+                json.dump(self._state, f)
+        except Exception as e:
+            log.warning(f"No se pudo guardar estado de rate limiter: {e}")
 
     @property
     def remaining(self) -> int:
@@ -130,11 +150,31 @@ class ApiRateLimiter:
         return self._state["count"] + n <= self.daily_limit
 
     def consume(self, n: int = 1):
-        """Registra N requests consumidos."""
+        """Registra N requests consumidos. Alerta si quedan pocos."""
         self._state["count"] += n
         self._save()
-        log.debug(f"API Football: {self._state['count']}/{self.daily_limit} requests usados hoy")
+        log.debug(
+            f"API Football: {self._state['count']}/{self.daily_limit} "
+            f"requests usados hoy"
+        )
+        # Alerta de límite bajo (una sola vez por ejecución)
+        if self.remaining <= API_ALERT_THRESHOLD and not self._alerted:
+            self._alerted = True
+            msg = (
+                f"⚠️ *FOOTBOT — Rate Limit*\n"
+                f"API-Football: solo `{self.remaining}` requests restantes hoy.\n"
+                f"_Usado: {self._state['count']}/{self.daily_limit}_"
+            )
+            log.warning(f"Rate limit bajo: {self.remaining} requests restantes")
+            try:
+                # Import lazy para evitar circular en arranque
+                from src.telegram_sender import send_telegram
+                send_telegram(msg)
+            except Exception:
+                pass  # No bloquear el pipeline por una alerta fallida
 
     def status(self) -> str:
-        return (f"API-Football: {self._state['count']}/{self.daily_limit} "
-                f"requests usados ({self.remaining} restantes)")
+        return (
+            f"API-Football: {self._state['count']}/{self.daily_limit} "
+            f"requests usados ({self.remaining} restantes)"
+        )

@@ -2,10 +2,15 @@
 _04_value_detector.py
 Detecta value bets comparando probabilidades del modelo con cuotas del mercado.
 
-CORRECCIÓN PRINCIPAL: Las cuotas de referencia ahora son REALES.
-Se obtienen de Football-Data.co.uk (B365/Pinnacle) para el par de equipos.
-Solo se usa CUOTAS_FALLBACK cuando no hay cuotas históricas disponibles,
-y en ese caso el edge calculado se marca como "estimado" para transparencia.
+CAMBIOS v2:
+  1. Imports de _01_data_collector movidos al nivel del módulo (no en runtime),
+     con ImportError manejado claramente al arranque.
+  2. Double chance odds calculadas con fórmula exacta (no factor fijo 0.94).
+  3. market_prob_* se usa aquí como señal de divergencia modelo vs mercado,
+     pero ya no es feature de entrenamiento del XGBoost (leakage fix).
+  4. Nuevo campo edge_vs_market: diferencia entre prob modelo y prob implícita
+     del mercado actual, como señal de transparencia adicional.
+  5. classify_confidence usa n_matches_total (del fix en _02_).
 """
 
 import os
@@ -24,34 +29,48 @@ from config.settings import (
     KELLY_FRACCION, DATA_PROCESSED,
 )
 
+# Import al nivel del módulo — falla al arranque si hay problema,
+# no en runtime dentro de una función (más fácil de depurar)
+try:
+    from src._01_data_collector import get_best_closing_odds
+    _HAS_REAL_ODDS = True
+except ImportError as e:
+    _HAS_REAL_ODDS = False
+    logging.getLogger(__name__).warning(
+        f"get_best_closing_odds no disponible: {e}. "
+        "Se usarán cuotas estimadas."
+    )
+
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# Cuotas promedio del mercado europeo (fallback cuando no hay datos reales).
-# Se usan SOLO si no hay cuotas de Football-Data disponibles.
-# Valores ajustados al overround típico (~5-6%).
+# Cuotas estimadas del mercado europeo (fallback).
+# Solo se usan cuando no hay cuotas reales de Football-Data.
+# Con overround típico ~5-6%.
 CUOTAS_FALLBACK = {
-    "home_win":   2.10,
-    "draw":       3.40,
-    "away_win":   3.60,
-    "btts_si":    1.85,
-    "btts_no":    1.95,
-    "over25":     1.85,
-    "under25":    1.95,
-    "double_1x":  1.35,
-    "double_x2":  1.55,
-    "double_12":  1.30,
+    "home_win":  2.10,
+    "draw":      3.40,
+    "away_win":  3.60,
+    "btts_si":   1.85,
+    "btts_no":   1.95,
+    "over25":    1.85,
+    "under25":   1.95,
+    "double_1x": 1.35,
+    "double_x2": 1.55,
+    "double_12": 1.30,
 }
 
 MARKET_TO_PROB = {
-    "home_win":  "prob_home_win",
-    "draw":      "prob_draw",
-    "away_win":  "prob_away_win",
-    "btts_si":   "prob_btts",
-    "over25":    "prob_over25",
+    "home_win": "prob_home_win",
+    "draw":     "prob_draw",
+    "away_win": "prob_away_win",
+    "btts_si":  "prob_btts",
+    "over25":   "prob_over25",
 }
 
+
+# ─── CÁLCULOS CORE ───────────────────────────────────────────────────────────
 
 def calculate_edge(model_prob: float, decimal_odds: float) -> float:
     """Edge% = (prob × odds - 1) × 100. Positivo = value."""
@@ -68,6 +87,23 @@ def kelly_fraction(model_prob: float, decimal_odds: float,
     b     = decimal_odds - 1
     kelly = (model_prob * b - (1 - model_prob)) / b
     return round(max(kelly * fraction, 0.0) * 100, 2)
+
+
+def _double_chance_odds(odds_a: float, odds_b: float,
+                        overround: float = 0.95) -> float:
+    """
+    Calcula la cuota de doble chance con fórmula exacta.
+    DC(A o B) = 1 / (1/odds_a + 1/odds_b) * overround
+
+    CORRECCIÓN: antes se usaba un factor fijo de 0.94 aproximado.
+    Ahora la cuota refleja la suma de las probabilidades implícitas reales.
+    """
+    if odds_a <= 1.0 or odds_b <= 1.0:
+        return 1.10
+    fair_prob = (1 / odds_a) + (1 / odds_b)
+    if fair_prob >= 1.0:
+        return round(overround, 2)  # cota mínima
+    return round((1 / fair_prob) * overround, 3)
 
 
 def get_model_prob_for_market(market: str, predictions: dict) -> float:
@@ -90,29 +126,30 @@ def build_odds_dict(home_team: str, away_team: str,
     """
     Construye el diccionario de cuotas para un partido.
     Retorna (odds_dict, son_reales).
-
-    Prioridad:
-    1. Cuotas reales de Football-Data (Pinnacle > Bet365)
-    2. CUOTAS_FALLBACK (estimado)
     """
-    try:
-        from src._01_data_collector import get_best_closing_odds
-        real = get_best_closing_odds(home_team, away_team, historical)
-    except Exception:
-        real = None
+    real = None
+    if _HAS_REAL_ODDS and historical is not None and not historical.empty:
+        try:
+            real = get_best_closing_odds(home_team, away_team, historical)
+        except Exception as e:
+            log.debug(f"Error obteniendo cuotas reales para {home_team}: {e}")
 
     if real:
+        h_odds = real["home"]
+        d_odds = real["draw"]
+        a_odds = real["away"]
         odds = {
-            "home_win":  real["home"],
-            "draw":      real["draw"],
-            "away_win":  real["away"],
-            "btts_si":   CUOTAS_FALLBACK["btts_si"],   # no disponible en FD
+            "home_win":  h_odds,
+            "draw":      d_odds,
+            "away_win":  a_odds,
+            "btts_si":   CUOTAS_FALLBACK["btts_si"],
             "btts_no":   CUOTAS_FALLBACK["btts_no"],
-            "over25":    real.get("over25") or CUOTAS_FALLBACK["over25"],
+            "over25":    real.get("over25")  or CUOTAS_FALLBACK["over25"],
             "under25":   real.get("under25") or CUOTAS_FALLBACK["under25"],
-            "double_1x": round(1 / (1/real["home"] + 1/real["draw"]) * 0.94, 2),
-            "double_x2": round(1 / (1/real["draw"] + 1/real["away"]) * 0.94, 2),
-            "double_12": round(1 / (1/real["home"] + 1/real["away"]) * 0.94, 2),
+            # Doble chance con fórmula exacta (overround 95%)
+            "double_1x": _double_chance_odds(h_odds, d_odds),
+            "double_x2": _double_chance_odds(d_odds, a_odds),
+            "double_12": _double_chance_odds(h_odds, a_odds),
         }
         return odds, True
 
@@ -121,6 +158,10 @@ def build_odds_dict(home_team: str, away_team: str,
 
 def classify_confidence(edge: float, model_prob: float,
                         n_home: int, n_away: int) -> str | None:
+    """
+    Clasifica la apuesta. Usa n_matches_total (no la ventana de forma)
+    para que equipos con larga historia pasen el umbral correctamente.
+    """
     if (edge >= UMBRAL_EDGE_ALTA and
         model_prob >= UMBRAL_PROB_ALTA and
         n_home >= MIN_PARTIDOS_ALTA and
@@ -167,25 +208,49 @@ def build_explanation(market: str, features_row: dict,
     return " | ".join(parts) or "análisis estadístico del equipo"
 
 
+def _compute_edge_vs_market(model_prob: float,
+                             fixture_row: pd.Series,
+                             market: str) -> float | None:
+    """
+    Calcula la divergencia entre la probabilidad del modelo y la probabilidad
+    implícita del mercado actual (si está disponible en features).
+
+    market_prob_* ya no es feature de entrenamiento, pero sí está disponible
+    en el feature row de inferencia para este análisis.
+    """
+    market_col = {
+        "home_win":  "market_prob_home",
+        "draw":      "market_prob_draw",
+        "away_win":  "market_prob_away",
+    }.get(market)
+
+    if not market_col:
+        return None
+
+    market_prob = fixture_row.get(market_col)
+    if market_prob is None or market_prob <= 0:
+        return None
+
+    return round((model_prob - float(market_prob)) * 100, 2)
+
+
+# ─── ANALIZADOR PRINCIPAL ────────────────────────────────────────────────────
+
 def analyze_fixture(fixture_row: pd.Series, predictions: dict,
                     historical: pd.DataFrame = None) -> list:
     """
     Analiza un partido y retorna todas las value bets.
-    Ahora recibe el DataFrame histórico para obtener cuotas reales.
     """
     home   = fixture_row.get("home_team", "")
     away   = fixture_row.get("away_team", "")
+    # CORRECCIÓN: usar n_matches (que ahora es n_matches_total del _02_ fix)
     n_home = int(fixture_row.get("n_home_matches", 0))
     n_away = int(fixture_row.get("n_away_matches", 0))
 
-    # Obtener cuotas (reales si hay, estimadas si no)
-    if historical is not None and not historical.empty:
-        reference_odds, odds_are_real = build_odds_dict(home, away, historical)
-    else:
-        reference_odds, odds_are_real = CUOTAS_FALLBACK.copy(), False
+    reference_odds, odds_are_real = build_odds_dict(home, away, historical)
 
     if not odds_are_real:
-        log.debug(f"{home} vs {away}: usando cuotas estimadas (sin datos reales)")
+        log.debug(f"{home} vs {away}: cuotas estimadas (sin datos reales)")
 
     markets_to_check = ["home_win", "away_win", "btts_si", "over25"]
     if n_home >= MIN_PARTIDOS_ALTA and n_away >= MIN_PARTIDOS_ALTA:
@@ -200,20 +265,19 @@ def analyze_fixture(fixture_row: pd.Series, predictions: dict,
         odds       = reference_odds.get(market, CUOTAS_FALLBACK.get(market, 2.0))
         edge       = calculate_edge(model_prob, odds)
         confidence = classify_confidence(edge, model_prob, n_home, n_away)
+
+        # Umbral más conservador si las cuotas son estimadas
+        if not odds_are_real and confidence == "media":
+            confidence = None
         if confidence is None:
             continue
 
-        # Si las cuotas son estimadas, aplicar umbral de edge más conservador
-        if not odds_are_real and edge < UMBRAL_EDGE_ALTA:
-            confidence = None  # promover solo bets con edge alto si no hay cuotas reales
-        if confidence is None:
-            continue
-
-        kelly = kelly_fraction(model_prob, odds)
-        top_feats = predictions.get("top_features", {}).get(
+        kelly      = kelly_fraction(model_prob, odds)
+        top_feats  = predictions.get("top_features", {}).get(
             market.replace("_si", "").replace("_no", ""), []
         )
-        explanation = build_explanation(market, fixture_row.to_dict(), top_feats)
+        explanation     = build_explanation(market, fixture_row.to_dict(), top_feats)
+        edge_vs_market  = _compute_edge_vs_market(model_prob, fixture_row, market)
 
         display_map = {
             "home_win":  f"Victoria {home}",
@@ -229,28 +293,31 @@ def analyze_fixture(fixture_row: pd.Series, predictions: dict,
         }
 
         bets.append({
-            "home_team":      home,
-            "away_team":      away,
-            "league":         fixture_row.get("league_name", ""),
-            "match_date":     fixture_row.get("match_date", str(date.today())),
-            "market":         market,
-            "market_display": display_map.get(market, market),
-            "model_prob":     round(model_prob, 4),
-            "model_prob_pct": f"{model_prob*100:.1f}%",
-            "reference_odds": odds,
-            "odds_source":    "real" if odds_are_real else "estimada",
-            "edge_pct":       edge,
-            "kelly_pct":      kelly,
-            "confidence":     confidence,
-            "explanation":    explanation,
-            "exp_home_goals": round(predictions.get("dc_exp_home_goals", 0), 2),
-            "exp_away_goals": round(predictions.get("dc_exp_away_goals", 0), 2),
-            "n_home_matches": n_home,
-            "n_away_matches": n_away,
+            "home_team":       home,
+            "away_team":       away,
+            "league":          fixture_row.get("league_name", ""),
+            "match_date":      fixture_row.get("match_date", str(date.today())),
+            "market":          market,
+            "market_display":  display_map.get(market, market),
+            "model_prob":      round(model_prob, 4),
+            "model_prob_pct":  f"{model_prob*100:.1f}%",
+            "reference_odds":  odds,
+            "odds_source":     "real" if odds_are_real else "estimada",
+            "edge_pct":        edge,
+            "edge_vs_market":  edge_vs_market,   # NUEVO
+            "kelly_pct":       kelly,
+            "confidence":      confidence,
+            "explanation":     explanation,
+            "exp_home_goals":  round(predictions.get("dc_exp_home_goals", 0), 2),
+            "exp_away_goals":  round(predictions.get("dc_exp_away_goals", 0), 2),
+            "n_home_matches":  n_home,
+            "n_away_matches":  n_away,
         })
 
-    bets.sort(key=lambda x: ({"alta": 0, "media": 1}.get(x["confidence"], 9),
-                               -x["edge_pct"]))
+    bets.sort(key=lambda x: (
+        {"alta": 0, "media": 1}.get(x["confidence"], 9),
+        -x["edge_pct"]
+    ))
     return bets
 
 
@@ -285,13 +352,15 @@ def detect_all_value_bets(features_df: pd.DataFrame,
 def summarize_bets(bets_df: pd.DataFrame) -> dict:
     if bets_df.empty:
         return {"total": 0, "alta": 0, "media": 0}
-    return {
+    result = {
         "total":    len(bets_df),
         "alta":     len(bets_df[bets_df["confidence"] == "alta"]),
         "media":    len(bets_df[bets_df["confidence"] == "media"]),
         "edge_max": round(bets_df["edge_pct"].max(), 2),
         "edge_avg": round(bets_df["edge_pct"].mean(), 2),
-        "real_odds_pct": round(
-            len(bets_df[bets_df["odds_source"] == "real"]) / len(bets_df) * 100, 1
-        ) if "odds_source" in bets_df.columns else 0,
     }
+    if "odds_source" in bets_df.columns:
+        result["real_odds_pct"] = round(
+            len(bets_df[bets_df["odds_source"] == "real"]) / len(bets_df) * 100, 1
+        )
+    return result

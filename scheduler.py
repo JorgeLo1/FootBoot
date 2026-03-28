@@ -2,16 +2,11 @@
 scheduler.py
 Orquestador principal del pipeline diario de FOOTBOT.
 
-Correcciones respecto a versión anterior:
-  - should_retrain() se evalúa UNA SOLA VEZ al inicio (no dos veces)
-  - Imports uniformes: siempre src._XX_
-  - Validación de credenciales al arranque
-  - historical se carga una vez y se pasa a los módulos que lo necesitan
-  - Se pasan cuotas reales al value detector
-
-Cron en Oracle Cloud:
-  0 8  * * * cd /home/ubuntu/footbot && /home/ubuntu/footbot/venv/bin/python scheduler.py >> logs/cron.log 2>&1
-  0 23 * * * cd /home/ubuntu/footbot && /home/ubuntu/footbot/venv/bin/python src/_05_result_updater.py >> logs/cron_results.log 2>&1
+CAMBIOS v2:
+  - Captura RuntimeError de _save_as_latest (modelos no actualizados)
+  - Envía resumen de métricas de validación (ROI) después del re-entrenamiento
+  - historical se carga una vez y se pasa a todos los módulos
+  - should_retrain() evaluado una sola vez al inicio
 """
 
 import os
@@ -48,32 +43,23 @@ log = logging.getLogger("footbot")
 # ─── VALIDACIÓN DE CREDENCIALES ───────────────────────────────────────────────
 
 def validate_credentials() -> list[str]:
-    """
-    Verifica que las variables de entorno críticas estén configuradas.
-    Retorna lista de problemas encontrados (vacía = todo OK).
-    """
     placeholders = {
-        "API_FOOTBALL_KEY":   (API_FOOTBALL_KEY,   "TU_API_KEY_AQUI"),
-        "TELEGRAM_TOKEN":     (TELEGRAM_TOKEN,     "TU_BOT_TOKEN_AQUI"),
-        "TELEGRAM_CHAT_ID":   (TELEGRAM_CHAT_ID,   "TU_CHAT_ID_AQUI"),
-        "SUPABASE_URL":       (SUPABASE_URL,       "TU_SUPABASE_URL_AQUI"),
-        "SUPABASE_KEY":       (SUPABASE_KEY,       "TU_SUPABASE_ANON_KEY_AQUI"),
+        "API_FOOTBALL_KEY": (API_FOOTBALL_KEY, "TU_API_KEY_AQUI"),
+        "TELEGRAM_TOKEN":   (TELEGRAM_TOKEN,   "TU_BOT_TOKEN_AQUI"),
+        "TELEGRAM_CHAT_ID": (TELEGRAM_CHAT_ID, "TU_CHAT_ID_AQUI"),
+        "SUPABASE_URL":     (SUPABASE_URL,     "TU_SUPABASE_URL_AQUI"),
+        "SUPABASE_KEY":     (SUPABASE_KEY,     "TU_SUPABASE_ANON_KEY_AQUI"),
     }
-    issues = []
-    for name, (value, placeholder) in placeholders.items():
-        if not value or value == placeholder:
-            issues.append(f"  ✗ {name} no configurada")
-    return issues
+    return [
+        f"  ✗ {name} no configurada"
+        for name, (value, placeholder) in placeholders.items()
+        if not value or value == placeholder
+    ]
 
 
 # ─── LÓGICA DE RE-ENTRENAMIENTO ──────────────────────────────────────────────
 
 def should_retrain() -> bool:
-    """
-    Retorna True si hay que re-entrenar.
-    CORRECCIÓN: Se llama UNA sola vez al inicio del pipeline para evitar
-    inconsistencias si la ejecución cruza medianoche (ej: lunes a las 23:59).
-    """
     no_model  = not os.path.exists(os.path.join(MODELS_DIR, "ensemble_latest.pkl"))
     is_monday = datetime.now().weekday() == 0
     return no_model or is_monday
@@ -86,18 +72,14 @@ def run_pipeline():
     log.info(f"  FOOTBOT · {datetime.now().strftime('%Y-%m-%d %H:%M')}  ")
     log.info("═" * 55)
 
-    # ── Validar credenciales antes de empezar ────────────────────────────
     issues = validate_credentials()
     if issues:
         log.warning("Credenciales no configuradas:")
         for issue in issues:
             log.warning(issue)
-        # Continuar de todas formas (Supabase y Telegram son opcionales
-        # para una primera ejecución de prueba)
 
     from src.telegram_sender import send_error_notification, send_telegram
 
-    # ── Evaluar retrain UNA VEZ ──────────────────────────────────────────
     retrain = should_retrain()
     log.info(f"Re-entrenar modelo hoy: {retrain}")
 
@@ -140,8 +122,8 @@ def run_pipeline():
         )
 
         # Cargar histórico UNA VEZ — se reutiliza en pasos 3, 4 y 5
-        historical   = load_historical_results()
-        features_df  = build_features_for_fixtures(fixtures)
+        historical  = load_historical_results()
+        features_df = build_features_for_fixtures(fixtures)
 
         if features_df.empty:
             send_error_notification("Paso 2: DataFrame de features vacío")
@@ -156,6 +138,7 @@ def run_pipeline():
 
     # ── PASO 3: Modelo ────────────────────────────────────────────────────
     log.info("\n▶ PASO 3 — Modelo predictivo")
+    ensemble = None  # Para acceder al resumen de validación después
     try:
         from src._03_model_engine import (
             train_and_save, load_models, predict_match,
@@ -163,8 +146,17 @@ def run_pipeline():
 
         if retrain:
             log.info("Re-entrenando modelo...")
-            training_df = build_training_dataset(historical)
-            dc, ensemble = train_and_save(training_df)
+            try:
+                training_df = build_training_dataset(historical)
+                dc, ensemble = train_and_save(training_df)
+            except RuntimeError as e:
+                # _save_as_latest falló — notificar pero continuar con modelos viejos
+                log.error(f"Error guardando modelo latest: {e}")
+                send_error_notification(
+                    f"⚠️ Modelo re-entrenado pero NO guardado como latest:\n{e}\n"
+                    "Se usarán los modelos del día anterior."
+                )
+                dc, ensemble = load_models()
         else:
             dc, ensemble = load_models()
 
@@ -182,6 +174,14 @@ def run_pipeline():
 
         log.info(f"✓ Paso 3: {len(all_predictions)} predicciones generadas")
 
+        # Enviar resumen de validación del modelo si se re-entrenó
+        if retrain and ensemble is not None:
+            try:
+                summary = ensemble.get_validation_summary()
+                send_telegram(summary)
+            except Exception:
+                pass  # No bloquear el pipeline por esto
+
     except Exception as e:
         log.error(f"Error Paso 3: {e}\n{traceback.format_exc()}")
         send_error_notification(f"Paso 3 falló:\n{str(e)}")
@@ -193,7 +193,7 @@ def run_pipeline():
     try:
         from src._04_value_detector import detect_all_value_bets, summarize_bets
 
-        # Pasar histórico para usar cuotas reales de Football-Data
+        # Pasar historical para cuotas reales de Football-Data
         bets_df = detect_all_value_bets(features_df, all_predictions, historical)
         summary = summarize_bets(bets_df)
         log.info(f"✓ Paso 4: {summary}")
