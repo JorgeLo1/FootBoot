@@ -1,7 +1,7 @@
 """
-telegram_sender.py
+telegram_sender.py — v5
 Formatea y envía el reporte diario a Telegram.
-Corrección: valida el token antes de intentar enviar.
+Soporte completo para mercados expandidos — agrupados por partido y categoría.
 """
 
 import sys
@@ -28,14 +28,58 @@ MESES_ES = {
 
 PLACEHOLDER_TOKENS = {"TU_BOT_TOKEN_AQUI", "TU_CHAT_ID_AQUI", "", None}
 
+# Grupos de mercados para el mensaje — orden de aparición
+MARKET_GROUPS = {
+    "resultado": ["home_win", "draw", "away_win",
+                  "double_1x", "double_x2", "double_12"],
+    "goles":     ["over15", "under15", "over25", "under25",
+                  "over35", "under35", "over45"],
+    "btts":      ["btts_si", "btts_no"],
+    "por_equipo":["home_over05", "home_under05", "home_over15", "home_under15",
+                  "away_over05", "away_under05", "away_over15", "away_under15"],
+    "exactos":   ["exact_0", "exact_1", "exact_2", "exact_3", "exact_4plus"],
+    "combinadas":["home_and_btts", "draw_and_btts", "away_and_btts"],
+    "handicap":  ["ah_home_minus05", "ah_away_minus05",
+                  "ah_home_plus05",  "ah_away_plus05",
+                  "ah_home_minus1",  "ah_away_minus1"],
+}
+
+GROUP_EMOJI = {
+    "resultado":  "🏆",
+    "goles":      "⚽",
+    "btts":       "🔵",
+    "por_equipo": "🎯",
+    "exactos":    "🔢",
+    "combinadas": "🔗",
+    "handicap":   "⚖️",
+}
+
+GROUP_LABELS = {
+    "resultado":  "Resultado",
+    "goles":      "Totales de goles",
+    "btts":       "Ambos marcan",
+    "por_equipo": "Goles por equipo",
+    "exactos":    "Goles exactos",
+    "combinadas": "Combinadas",
+    "handicap":   "Asian Handicap",
+}
+
+# Etiqueta de fuente de cuota para el usuario
+_ODDS_SOURCE_LABEL = {
+    "espn_live":      "",                      # cuota real — no necesita nota
+    "exact_match":    "",                      # cuota real — no necesita nota
+    "contextual_avg": " _(hist.)_",            # real pero no del partido exacto
+    "fd_historical":  " _(hist.)_",
+    "model_implied":  " _(est.)_",             # derivada del modelo
+}
+
 
 def _credentials_ok() -> bool:
-    """Valida que el token y chat_id sean reales antes de hacer requests."""
     if TELEGRAM_TOKEN in PLACEHOLDER_TOKENS:
-        log.warning("TELEGRAM_TOKEN no configurado. Skipping notificaciones.")
+        log.warning("TELEGRAM_TOKEN no configurado.")
         return False
     if TELEGRAM_CHAT_ID in PLACEHOLDER_TOKENS:
-        log.warning("TELEGRAM_CHAT_ID no configurado. Skipping notificaciones.")
+        log.warning("TELEGRAM_CHAT_ID no configurado.")
         return False
     return True
 
@@ -46,6 +90,91 @@ def format_date_es(d: date) -> str:
     return f"{dia_es} {d.day} {mes_es}"
 
 
+def _render_bet_line(bet: pd.Series) -> str:
+    """
+    Renderiza una apuesta en una sola línea compacta + línea de detalle.
+    Formato:
+      📌 *Mercado*  Prob: 63.2%  Cuota: 1.85 _(hist.)_  Edge: +8.4%
+         Kelly: 1.2% bankroll | explicación
+    """
+    source_tag = _ODDS_SOURCE_LABEL.get(bet.get("odds_source", ""), " _(est.)_")
+
+    line1 = (
+        f"  📌 *{bet['market_display']}*\n"
+        f"     Prob `{bet['model_prob_pct']}` · "
+        f"Cuota `{bet['reference_odds']}`{source_tag} · "
+        f"Edge `+{bet['edge_pct']}%`"
+    )
+    line2_parts = [f"Kelly `{bet['kelly_pct']}%`"]
+    if bet.get("explanation"):
+        line2_parts.append(bet["explanation"])
+    line2 = "     " + " | ".join(line2_parts)
+
+    return f"{line1}\n{line2}"
+
+
+def _group_bets_by_match(bets_df: pd.DataFrame) -> list[dict]:
+    """Agrupa apuestas por partido manteniendo el orden alta → media."""
+    seen   = {}
+    result = []
+    for _, bet in bets_df.iterrows():
+        key = (bet["home_team"], bet["away_team"])
+        if key not in seen:
+            seen[key] = len(result)
+            result.append({
+                "home":     bet["home_team"],
+                "away":     bet["away_team"],
+                "league":   bet.get("league", ""),
+                "mu":       bet.get("exp_home_goals", 0),
+                "lam":      bet.get("exp_away_goals", 0),
+                "bets":     [],
+            })
+        result[seen[key]]["bets"].append(bet)
+    return result
+
+
+def _render_match_block(match: dict) -> list[str]:
+    """
+    Bloque de un partido con encabezado + apuestas agrupadas por categoría.
+    """
+    home  = match["home"]
+    away  = match["away"]
+    mu    = match["mu"]
+    lam   = match["lam"]
+
+    lines = [
+        f"*{home} vs {away}*",
+        f"🏆 {match['league']}",
+        f"📈 Esperados: `{mu:.1f}` – `{lam:.1f}` (total `{mu+lam:.1f}`)",
+        "",
+    ]
+
+    # Agrupar apuestas por categoría
+    by_group: dict[str, list] = {}
+    for bet in match["bets"]:
+        placed = False
+        for group, markets in MARKET_GROUPS.items():
+            if bet["market"] in markets:
+                by_group.setdefault(group, []).append(bet)
+                placed = True
+                break
+        if not placed:
+            by_group.setdefault("otros", []).append(bet)
+
+    for group in list(MARKET_GROUPS.keys()) + ["otros"]:
+        group_bets = by_group.get(group)
+        if not group_bets:
+            continue
+        emoji = GROUP_EMOJI.get(group, "•")
+        label = GROUP_LABELS.get(group, group.title())
+        lines.append(f"_{emoji} {label}_")
+        for bet in group_bets:
+            lines.append(_render_bet_line(pd.Series(bet)))
+        lines.append("")
+
+    return lines
+
+
 def format_message(bets_df: pd.DataFrame, model_stats: dict = None) -> str:
     today = date.today()
     fecha = format_date_es(today)
@@ -54,42 +183,35 @@ def format_message(bets_df: pd.DataFrame, model_stats: dict = None) -> str:
     alta  = bets_df[bets_df["confidence"] == "alta"]  if not bets_df.empty else pd.DataFrame()
     media = bets_df[bets_df["confidence"] == "media"] if not bets_df.empty else pd.DataFrame()
 
+    # Contar cuántas son con cuotas reales
+    n_real = 0
+    if not bets_df.empty and "odds_are_real" in bets_df.columns:
+        n_real = int(bets_df["odds_are_real"].sum())
+
+    subtitle_parts = [f"_{total} apuesta{'s' if total != 1 else ''}_"]
+    if total > 0 and n_real < total:
+        n_est = total - n_real
+        subtitle_parts.append(f"_({n_est} con cuota estimada)_")
+
     lines = [
         f"⚽ *FOOTBOT · {fecha}*",
-        f"_{total} apuesta{'s' if total != 1 else ''} encontrada{'s' if total != 1 else ''}_",
+        " ".join(subtitle_parts),
         "",
     ]
 
-    def render_bet(bet: pd.Series, show_goals: bool = True) -> list:
-        odds_tag = "" if bet.get("odds_source") == "real" else " _(cuota estimada)_"
-        result = [
-            f"*{bet['home_team']} vs {bet['away_team']}*",
-            f"🏆 {bet.get('league', '')}",
-            f"📌 {bet['market_display']}",
-            (f"📊 Prob: `{bet['model_prob_pct']}`  "
-             f"Cuota: `{bet['reference_odds']}`{odds_tag}  "
-             f"Edge: `+{bet['edge_pct']}%`"),
-            f"💰 Kelly: `{bet['kelly_pct']}%` bankroll",
-        ]
-        if show_goals and bet.get("exp_home_goals") and bet.get("exp_away_goals"):
-            result.append(
-                f"📈 Goles esperados: "
-                f"{bet['exp_home_goals']:.1f} – {bet['exp_away_goals']:.1f}"
-            )
-        if bet.get("explanation"):
-            result.append(f"💡 _{bet['explanation']}_")
-        result.append("")
-        return result
-
     if not alta.empty:
-        lines += ["🟢 *ALTA CONFIANZA*", "─" * 28]
-        for _, bet in alta.iterrows():
-            lines += render_bet(bet, show_goals=True)
+        lines += ["🟢 *ALTA CONFIANZA*", "─" * 28, ""]
+        for match in _group_bets_by_match(alta):
+            lines += _render_match_block(match)
+            lines.append("· · ·")
+        lines.append("")
 
     if not media.empty:
-        lines += ["🟡 *MEDIA CONFIANZA*", "─" * 28]
-        for _, bet in media.iterrows():
-            lines += render_bet(bet, show_goals=False)
+        lines += ["🟡 *MEDIA CONFIANZA*", "─" * 28, ""]
+        for match in _group_bets_by_match(media):
+            lines += _render_match_block(match)
+            lines.append("· · ·")
+        lines.append("")
 
     if total == 0:
         lines += [
@@ -99,26 +221,32 @@ def format_message(bets_df: pd.DataFrame, model_stats: dict = None) -> str:
         ]
 
     lines.append("─" * 28)
+
     if model_stats and model_stats.get("total", 0) > 10:
         tasa = model_stats.get("tasa_pct", 0)
-        roi  = model_stats.get("roi_pct", 0)
-        tot  = model_stats.get("total", 0)
+        roi  = model_stats.get("roi_pct",  0)
+        tot  = model_stats.get("total",    0)
         lines.append(
-            f"📉 *Rendimiento* ({tot} apuestas)  "
-            f"Acierto: `{tasa}%`  ROI: `{roi:+.1f}%`"
+            f"📊 *Rendimiento* ({tot} apuestas): "
+            f"Acierto `{tasa}%` · ROI `{roi:+.1f}%`"
         )
         if "tasa_alta_pct" in model_stats:
             lines.append(
-                f"🟢 Alta: `{model_stats['tasa_alta_pct']}%`  "
+                f"  🟢 Alta: `{model_stats['tasa_alta_pct']}%` · "
                 f"ROI `{model_stats.get('roi_alta_pct', 0):+.1f}%`"
             )
         if "tasa_media_pct" in model_stats:
             lines.append(
-                f"🟡 Media: `{model_stats['tasa_media_pct']}%`  "
+                f"  🟡 Media: `{model_stats['tasa_media_pct']}%` · "
                 f"ROI `{model_stats.get('roi_media_pct', 0):+.1f}%`"
             )
+        # Top mercados si están disponibles
+        top_mkts = model_stats.get("top_mercados")
+        if top_mkts:
+            mkt_str = " · ".join(f"{m}(`{v}`)" for m, v in list(top_mkts.items())[:3])
+            lines.append(f"  📌 Top mercados: {mkt_str}")
     else:
-        lines.append("_Estadísticas disponibles tras 10+ apuestas cerradas_")
+        lines.append("_Stats disponibles tras 10+ apuestas cerradas_")
 
     lines += [
         "",
@@ -128,16 +256,15 @@ def format_message(bets_df: pd.DataFrame, model_stats: dict = None) -> str:
 
 
 def send_telegram(message: str) -> bool:
-    """Envía un mensaje a Telegram. Retorna False si las credenciales no están listas."""
     if not _credentials_ok():
-        log.info(f"[TELEGRAM SIMULADO]\n{message[:300]}...")
+        log.info(f"[TELEGRAM SIMULADO]\n{message[:600]}...")
         return False
 
     url    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    # Telegram límite: 4096 chars por mensaje
     chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
-
     success = True
-    for i, chunk in enumerate(chunks):
+    for chunk in chunks:
         try:
             resp = requests.post(
                 url,
@@ -150,14 +277,12 @@ def send_telegram(message: str) -> bool:
                 timeout=15,
             )
             resp.raise_for_status()
-            data = resp.json()
-            if not data.get("ok"):
-                log.error(f"Telegram error: {data.get('description', data)}")
+            if not resp.json().get("ok"):
+                log.error(f"Telegram error: {resp.json().get('description')}")
                 success = False
         except Exception as e:
             log.error(f"Error enviando a Telegram: {e}")
             success = False
-
     return success
 
 

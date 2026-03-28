@@ -327,21 +327,15 @@ def get_fixtures_hoy(client=None, target_date: str = None) -> list[dict]:
 
 # ─── CUOTAS EN TIEMPO REAL (Core API /odds) ───────────────────────────────────
 
-def to_decimal(val) -> float | None:
+def _to_decimal(val) -> float | None:
     """
-    FIX A2/A3: convierte moneyline americano a cuota decimal.
-
-    Maneja:
-      - None → None
-      - Coma decimal (270,0 → 270.0) — DraftKings col.1 / entornos ES
-      - Int32, Decimal, float, str — tipos mixtos según provider
-      - Moneyline americano (+200 → 3.00, -150 → 1.67)
-      - Ya en formato decimal (> 1.0 y < 100) → devuelve tal cual
+    Convierte moneyline americano a decimal.
+    También acepta valores ya en decimal (>1 y <100).
+    Maneja coma decimal (270,0 → 270.0).
     """
     if val is None:
         return None
     try:
-        # Normalizar coma decimal antes de float()
         v = float(str(val).replace(",", "."))
         if v >= 100:     return round(v / 100 + 1, 3)   # +200 → 3.00
         elif v <= -100:  return round(-100 / v + 1, 3)  # -150 → 1.67
@@ -351,114 +345,224 @@ def to_decimal(val) -> float | None:
         return None
 
 
-def get_match_odds(client: ESPNClient, slug: str,
-                   event_id: str) -> dict | None:
+def get_match_odds(client, slug: str, event_id: str) -> dict | None:
     """
-    FIX A2: itera providers hasta encontrar uno con datos válidos.
-
-    Bet365 (priority=0) tiene moneyLines en null → se salta.
-    DraftKings (priority=1) tiene valores pero con tipos mixtos → to_decimal los maneja.
-    El código anterior tomaba solo el primer provider (sorted[0]) y retornaba None
-    cuando ese provider (Bet365) no tenía datos. Ahora itera hasta encontrar uno útil.
-
-    Endpoint: /events/{id}/competitions/{id}/odds
+    Extrae cuotas del Core API /odds.
+ 
+    Schema confirmado (response_schemas.md — Betting Odds section):
+    {
+      "items": [{
+        "provider": {"id": "41", "name": "DraftKings", "priority": 1},
+        "overUnder": 2.5,          ← línea de goles totales
+        "spread": -0.5,            ← handicap (negativo = favorito local)
+        "overOdds": -110,          ← moneyline americano para Over
+        "underOdds": -110,         ← moneyline americano para Under
+        "homeTeamOdds": {
+          "moneyLine": -165,       ← 1X2 local
+          "spreadOdds": -110       ← cuota del spread para local
+        },
+        "awayTeamOdds": {
+          "moneyLine": 140         ← 1X2 visitante
+        },
+        "drawOdds": {              ← SOLO en fútbol
+          "moneyLine": 280
+        },
+        "open": {                  ← líneas de apertura
+          "over":  {"value": 2.5},
+          "under": {"value": 2.5},
+          "spread": {"home": {"line": -0.5}}
+        }
+      }]
+    }
+ 
+    Itera providers por prioridad ascendente, salta los que tienen
+    moneyLine null en home o away.
     """
-    url  = f"{ESPN_CORE_V2}/{slug}/events/{event_id}/competitions/{event_id}/odds"
+    import logging
+    log = logging.getLogger(__name__)
+ 
+    url  = f"https://sports.core.api.espn.com/v2/sports/soccer/leagues/{slug}/events/{event_id}/competitions/{event_id}/odds"
     data = client.get(url, params={"limit": 5})
     if not data:
         return None
-
+ 
     items = data.get("items", [])
     if not items:
         return None
-
-    # Ordenar por prioridad ascendente (0 = más oficial)
+ 
     items_sorted = sorted(
         items,
         key=lambda x: x.get("provider", {}).get("priority", 999)
     )
-
+ 
     for item in items_sorted:
         try:
-            home_odds = item.get("homeTeamOdds") or {}
-            away_odds = item.get("awayTeamOdds") or {}
-            draw_odds = item.get("drawOdds")     or {}
-
-            h_raw = home_odds.get("moneyLine")
-            a_raw = away_odds.get("moneyLine")
-            d_raw = draw_odds.get("moneyLine")
-
-            # Saltar provider sin datos (e.g. Bet365 con null)
-            if h_raw is None or a_raw is None:
+            home_odds_raw = item.get("homeTeamOdds") or {}
+            away_odds_raw = item.get("awayTeamOdds") or {}
+            draw_odds_raw = item.get("drawOdds")     or {}
+ 
+            h_ml = home_odds_raw.get("moneyLine")
+            a_ml = away_odds_raw.get("moneyLine")
+            # Para fútbol, drawOdds es un objeto separado con su propio moneyLine
+            d_ml = draw_odds_raw.get("moneyLine")
+ 
+            if h_ml is None or a_ml is None:
                 provider_name = item.get("provider", {}).get("name", "?")
-                log.debug(f"Provider {provider_name} sin moneyLine — probando siguiente")
+                log.debug(f"Provider {provider_name} sin moneyLine — siguiente")
                 continue
-
-            h = to_decimal(h_raw)
-            a = to_decimal(a_raw)
-            d = to_decimal(d_raw)
-
+ 
+            h = _to_decimal(h_ml)
+            a = _to_decimal(a_ml)
+            d = _to_decimal(d_ml) if d_ml is not None else None
+ 
             if not h or not a:
                 continue
-
+ 
+            # ── Over/Under ────────────────────────────────────────────────
+            # overUnder es la LÍNEA (ej: 2.5), no las cuotas
+            total_line  = item.get("overUnder")    # float: 2.5
+            over_odds   = item.get("overOdds")     # int americano: -110
+            under_odds  = item.get("underOdds")    # int americano: -110
+ 
+            over_dec  = _to_decimal(over_odds)  if over_odds  is not None else None
+            under_dec = _to_decimal(under_odds) if under_odds is not None else None
+ 
+            # ── Spread / Asian Handicap ───────────────────────────────────
+            spread_line      = item.get("spread")                            # float: -0.5
+            spread_home_odds = home_odds_raw.get("spreadOdds")               # int: -110
+            spread_away_odds = away_odds_raw.get("spreadOdds")               # int: -110
+            spread_home_dec  = _to_decimal(spread_home_odds) if spread_home_odds is not None else None
+            spread_away_dec  = _to_decimal(spread_away_odds) if spread_away_odds is not None else None
+ 
+            # ── Apertura (movimiento de línea) ────────────────────────────
+            open_data        = item.get("open") or {}
+            open_total_line  = (open_data.get("over")   or {}).get("value")
+            open_spread_home = ((open_data.get("spread") or {}).get("home") or {}).get("line")
+ 
+            provider_name = item.get("provider", {}).get("name", "ESPN")
+ 
             return {
-                "home":     h,
-                "draw":     d or 3.40,
-                "away":     a,
-                "provider": item.get("provider", {}).get("name", "ESPN"),
-                "source":   "espn_odds",
+                # 1X2
+                "home":               h,
+                "draw":               d or 3.40,   # fallback si no hay empate
+                "away":               a,
+                # Over/Under
+                "total_line":         float(total_line) if total_line is not None else 2.5,
+                "over_odds":          over_dec,
+                "under_odds":         under_dec,
+                # Spread / AH
+                "spread_line":        float(spread_line) if spread_line is not None else None,
+                "spread_home_odds":   spread_home_dec,
+                "spread_away_odds":   spread_away_dec,
+                # Apertura
+                "open_total_line":    float(open_total_line) if open_total_line is not None else None,
+                "open_spread_home":   float(open_spread_home) if open_spread_home is not None else None,
+                # Meta
+                "provider":           provider_name,
+                "source":             "espn_odds",
             }
-
+ 
         except (TypeError, ValueError, KeyError) as e:
             log.debug(f"Error parseando odds item {event_id}: {e}")
             continue
-
-    log.debug(f"Ningún provider con odds válidas para event {event_id}")
+ 
+    log.debug(f"Sin odds válidas para event {event_id}")
     return None
 
 
-def enrich_fixtures_with_odds(client: ESPNClient,
-                               fixtures_df: pd.DataFrame) -> pd.DataFrame:
+def enrich_fixtures_with_odds(client, fixtures_df) -> "pd.DataFrame":
     """
-    Añade cuotas reales ESPN a los fixtures del día.
-    Se llama en el scheduler ANTES del value detector.
-
-    Añade columnas:
-        espn_odds_home, espn_odds_draw, espn_odds_away,
-        espn_odds_provider, espn_odds_available (bool)
+    Enriquece el DataFrame de fixtures con todas las cuotas ESPN disponibles.
+ 
+    Columnas añadidas (nuevas en v5):
+        espn_odds_home          float   cuota decimal local (1X2)
+        espn_odds_draw          float   cuota decimal empate (1X2)
+        espn_odds_away          float   cuota decimal visitante (1X2)
+        espn_odds_provider      str     nombre del provider
+        espn_odds_available     bool    True si hay cuotas válidas
+        espn_total_line         float   línea over/under (ej: 2.5)
+        espn_over_odds          float   cuota decimal Over
+        espn_under_odds         float   cuota decimal Under
+        espn_spread_line        float   handicap de línea (ej: -0.5 para local)
+        espn_spread_home_odds   float   cuota decimal spread local
+        espn_spread_away_odds   float   cuota decimal spread visitante
+        espn_open_total_line    float   línea de apertura (movimiento)
+        espn_open_spread_home   float   spread de apertura
     """
+    import pandas as pd
+    import logging
+    log = logging.getLogger(__name__)
+ 
     if fixtures_df.empty:
         return fixtures_df
-
+ 
+    # Importar mapping id→slug del módulo principal
+    try:
+        from src.espn_collector import _ID_A_SLUG
+    except ImportError:
+        # Si se usa standalone, construir desde settings
+        from config.settings import LIGAS_ESPN, COMPETICIONES_NACIONALES_ESPN
+        _todos = {**LIGAS_ESPN, **COMPETICIONES_NACIONALES_ESPN}
+        _ID_A_SLUG = {v[0]: k for k, v in _todos.items()}
+ 
     df = fixtures_df.copy()
-    df["espn_odds_home"]      = None
-    df["espn_odds_draw"]      = None
-    df["espn_odds_away"]      = None
-    df["espn_odds_provider"]  = None
-    df["espn_odds_available"] = False
-
+ 
+    # Inicializar columnas nuevas
+    new_cols = {
+        "espn_odds_home":        None,
+        "espn_odds_draw":        None,
+        "espn_odds_away":        None,
+        "espn_odds_provider":    None,
+        "espn_odds_available":   False,
+        "espn_total_line":       None,
+        "espn_over_odds":        None,
+        "espn_under_odds":       None,
+        "espn_spread_line":      None,
+        "espn_spread_home_odds": None,
+        "espn_spread_away_odds": None,
+        "espn_open_total_line":  None,
+        "espn_open_spread_home": None,
+    }
+    for col, default in new_cols.items():
+        df[col] = default
+ 
+    n_ok = 0
     for idx, row in df.iterrows():
         slug     = _ID_A_SLUG.get(int(row.get("league_id", 0)))
         event_id = str(row.get("fixture_id", ""))
         if not slug or not event_id:
             continue
-
+ 
         odds = get_match_odds(client, slug, event_id)
-        if odds:
-            df.at[idx, "espn_odds_home"]      = odds["home"]
-            df.at[idx, "espn_odds_draw"]      = odds["draw"]
-            df.at[idx, "espn_odds_away"]      = odds["away"]
-            df.at[idx, "espn_odds_provider"]  = odds["provider"]
-            df.at[idx, "espn_odds_available"] = True
-            log.info(
-                f"Odds {row['home_team']} vs {row['away_team']}: "
-                f"{odds['home']}/{odds['draw']}/{odds['away']} ({odds['provider']})"
-            )
-        else:
-            log.debug(f"Sin odds ESPN: {row.get('home_team')} vs {row.get('away_team')}")
-
-    n = int(df["espn_odds_available"].sum())
-    log.info(f"Odds ESPN disponibles: {n}/{len(df)} partidos")
+        if not odds:
+            log.debug(f"Sin odds: {row.get('home_team')} vs {row.get('away_team')}")
+            continue
+ 
+        df.at[idx, "espn_odds_home"]        = odds["home"]
+        df.at[idx, "espn_odds_draw"]        = odds["draw"]
+        df.at[idx, "espn_odds_away"]        = odds["away"]
+        df.at[idx, "espn_odds_provider"]    = odds["provider"]
+        df.at[idx, "espn_odds_available"]   = True
+        df.at[idx, "espn_total_line"]       = odds.get("total_line")
+        df.at[idx, "espn_over_odds"]        = odds.get("over_odds")
+        df.at[idx, "espn_under_odds"]       = odds.get("under_odds")
+        df.at[idx, "espn_spread_line"]      = odds.get("spread_line")
+        df.at[idx, "espn_spread_home_odds"] = odds.get("spread_home_odds")
+        df.at[idx, "espn_spread_away_odds"] = odds.get("spread_away_odds")
+        df.at[idx, "espn_open_total_line"]  = odds.get("open_total_line")
+        df.at[idx, "espn_open_spread_home"] = odds.get("open_spread_home")
+        n_ok += 1
+ 
+        log.info(
+            f"Odds {row['home_team']} vs {row['away_team']}: "
+            f"1X2={odds['home']}/{odds['draw']}/{odds['away']} | "
+            f"O/U {odds.get('total_line', '?')} "
+            f"({odds.get('over_odds','?')}/{odds.get('under_odds','?')}) | "
+            f"AH {odds.get('spread_line','?')} "
+            f"[{odds['provider']}]"
+        )
+ 
+    log.info(f"Odds ESPN disponibles: {n_ok}/{len(df)} partidos")
     return df
 
 

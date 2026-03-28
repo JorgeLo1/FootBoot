@@ -1,23 +1,36 @@
 """
-_04_value_detector.py
+_04_value_detector.py — v5
 Detecta value bets comparando probabilidades del modelo con cuotas del mercado.
 
-CAMBIOS v4:
-  1. build_odds_dict ahora tiene 3 niveles de fuentes:
-       a) Cuotas ESPN en tiempo real (Core API /odds) — mejor fuente disponible
-       b) Cuotas históricas Football-Data.co.uk (cierre, partido exacto o contextual)
-       c) Fallback a cuotas estimadas
-  2. classify_confidence usa n_matches_total correctamente (fix bug v3).
-  3. Para ligas ESPN sin cuotas históricas, los umbrales de edge se elevan
-     automáticamente (más conservador sin cuotas reales como referencia).
-  4. odds_source en el output distingue: espn_live, exact_match, contextual_avg, fallback.
+MERCADOS EXPANDIDOS:
+  - Goles totales: Over/Under 0.5, 1.5, 2.5, 3.5, 4.5
+  - Goles por equipo: Over/Under 0.5 y 1.5 local y visitante
+  - Goles exactos: 0, 1, 2, 3, 4+ goles
+  - Combinadas: BTTS + resultado
+  - Asian Handicap: usa spread real ESPN cuando está disponible,
+    con fallback a ±0.5 calculado desde las probabilidades
+  - 1X2 y Doble Oportunidad
+
+CUOTAS ESPN INTEGRADAS (schema confirmado Core API /odds):
+  Nivel 1a — ESPN 1X2:        moneyLine home/away/draw (decimal convertido)
+  Nivel 1b — ESPN Over/Under: overOdds + underOdds sobre la línea espn_total_line
+  Nivel 1c — ESPN Spread:     spreadOdds sobre espn_spread_line (AH real)
+
+ESTRATEGIA model_implied (sin cuotas reales):
+  Mercados estándar (1X2, Over/Under 2.5): BLOQUEADOS — el mercado es
+  tan eficiente que sin referencia externa el edge es ruido.
+  Mercados nicho (exactos, por equipo, combinadas, AH nicho): permitidos
+  solo con umbral elevado (+12%/+8%) Y prob > 65%.
+  Justificación: el modelo tiene información asimétrica en mercados nicho
+  (xG real + DC por liga) que el mercado implícito promedio no captura.
 """
 
 import os
 import sys
 import logging
-import pandas as pd
 import numpy as np
+import pandas as pd
+from scipy.stats import poisson
 from datetime import date
 from pathlib import Path
 
@@ -33,9 +46,8 @@ from config.settings import (
 try:
     from src._02_feature_builder import normalize_team_name
     _HAS_NORMALIZER = True
-except ImportError as e:
+except ImportError:
     _HAS_NORMALIZER = False
-    logging.getLogger(__name__).warning(f"normalize_team_name no disponible: {e}")
     def normalize_team_name(name):
         return name.lower().strip()
 
@@ -43,72 +55,220 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-# ─── CUOTAS FALLBACK ─────────────────────────────────────────────────────────
+MAX_GOALS = 10
 
-CUOTAS_FALLBACK = {
-    "home_win":  2.10,
-    "draw":      3.40,
-    "away_win":  3.60,
-    "btts_si":   1.85,
-    "btts_no":   1.95,
-    "over25":    1.85,
-    "under25":   1.95,
-    "double_1x": 1.35,
-    "double_x2": 1.55,
-    "double_12": 1.30,
+# Umbrales para mercados nicho sin cuotas reales
+_EDGE_NICHO_ALTA  = UMBRAL_EDGE_ALTA  + 4.0   # 12%
+_EDGE_NICHO_MEDIA = UMBRAL_EDGE_MEDIA + 4.0   # 8%
+_PROB_NICHO       = 0.65
+
+# Mercados estándar bloqueados con model_implied (muy eficientes)
+_MERCADOS_BLOQUEADOS_MODEL_IMPLIED = {
+    "home_win", "draw", "away_win",
+    "over25", "under25",
+    "double_1x", "double_x2", "double_12",
 }
 
-MARKET_TO_PROB = {
-    "home_win": "prob_home_win",
-    "draw":     "prob_draw",
-    "away_win": "prob_away_win",
-    "btts_si":  "prob_btts",
-    "over25":   "prob_over25",
+# Cuotas fallback — SOLO si no hay ninguna fuente real ni ESPN
+CUOTAS_FALLBACK = {
+    "home_win":   2.10, "draw":       3.40, "away_win":   3.60,
+    "btts_si":    1.85, "btts_no":    1.95,
+    "over05":     1.15, "under05":    5.50,
+    "over15":     1.50, "under15":    2.50,
+    "over25":     1.85, "under25":    1.95,
+    "over35":     2.40, "under35":    1.55,
+    "over45":     3.20, "under45":    1.30,
+    "home_over05": 1.55, "home_under05": 2.30,
+    "home_over15": 2.30, "home_under15": 1.60,
+    "away_over05": 1.75, "away_under05": 2.00,
+    "away_over15": 2.80, "away_under15": 1.45,
+    "exact_0":    7.00, "exact_1":    4.00,
+    "exact_2":    3.40, "exact_3":    3.80, "exact_4plus": 2.80,
+    "home_and_btts": 3.20, "draw_and_btts": 5.50, "away_and_btts": 5.00,
+    "double_1x":  1.35, "double_x2":  1.55, "double_12":   1.30,
+    "ah_home_minus05": 1.90, "ah_home_plus05":  1.90,
+    "ah_away_minus05": 1.90, "ah_away_plus05":  1.90,
 }
 
 _N_RECENT_CONTEXT = 6
 
 
+# ─── DISTRIBUCIÓN POISSON ────────────────────────────────────────────────────
+
+def _poisson_matrix(mu: float, lam: float,
+                    max_g: int = MAX_GOALS) -> np.ndarray:
+    """Matriz P(home=i, away=j) normalizada."""
+    M = np.zeros((max_g + 1, max_g + 1))
+    for i in range(max_g + 1):
+        for j in range(max_g + 1):
+            M[i][j] = poisson.pmf(i, mu) * poisson.pmf(j, lam)
+    total = M.sum()
+    return M / total if total > 0 else M
+
+
+def compute_all_market_probs(mu: float, lam: float) -> dict:
+    """
+    Calcula probabilidades para todos los mercados desde goles esperados DC.
+
+    Los mercados 1X2, BTTS y Over/Under 2.5 serán sobreescritos en
+    analyze_fixture con el blend DC+XGBoost (más preciso).
+    El resto (exactos, por equipo, combinadas) usan Poisson puro,
+    que es la única fuente disponible para estos mercados.
+    """
+    M = _poisson_matrix(mu, lam)
+    n = MAX_GOALS
+
+    # 1X2
+    p_home = float(np.tril(M, -1).sum())
+    p_draw = float(np.diag(M).sum())
+    p_away = float(np.triu(M, 1).sum())
+    s = p_home + p_draw + p_away
+    if s > 0:
+        p_home /= s; p_draw /= s; p_away /= s
+
+    # BTTS
+    p_btts_si = float(M[1:, 1:].sum())
+
+    # Totales
+    def p_over(line):
+        return float(sum(M[i][j] for i in range(n+1) for j in range(n+1) if i+j > line))
+
+    # Marginales por equipo
+    home_pmf = M.sum(axis=1)
+    away_pmf = M.sum(axis=0)
+
+    # Exactos
+    p_exact = {k: float(sum(M[i][j] for i in range(n+1) for j in range(n+1) if i+j == k))
+               for k in range(4)}
+    p_exact["4plus"] = float(sum(M[i][j] for i in range(n+1) for j in range(n+1) if i+j >= 4))
+
+    # Combinadas resultado + BTTS
+    p_home_btts = float(sum(M[i][j] for i in range(1,n+1) for j in range(1,n+1) if i > j))
+    p_draw_btts = float(sum(M[i][j] for i in range(1,n+1) for j in range(1,n+1) if i == j))
+    p_away_btts = float(sum(M[i][j] for i in range(1,n+1) for j in range(1,n+1) if j > i))
+
+    # AH estándar ±0.5 (desde probabilidades — se mejora con spread ESPN real)
+    p_ah_home_minus05 = p_home              # local gana (sin empate)
+    p_ah_away_minus05 = p_away + p_draw     # visitante gana o empata
+    p_ah_home_plus05  = p_home + p_draw     # local gana o empata
+    p_ah_away_plus05  = p_away              # visitante gana
+
+    # AH -1 (local gana por 2+)
+    p_ah_home_minus1 = float(sum(M[i][j] for i in range(n+1) for j in range(n+1) if i-j >= 2))
+    p_ah_away_minus1 = 1.0 - p_ah_home_minus1
+
+    return {
+        "prob_home_win":    round(p_home, 4),
+        "prob_draw":        round(p_draw, 4),
+        "prob_away_win":    round(p_away, 4),
+        "prob_btts":        round(p_btts_si,        4),
+        "prob_btts_no":     round(1 - p_btts_si,    4),
+        "prob_over05":      round(p_over(0.5),       4),
+        "prob_under05":     round(1 - p_over(0.5),   4),
+        "prob_over15":      round(p_over(1.5),       4),
+        "prob_under15":     round(1 - p_over(1.5),   4),
+        "prob_over25":      round(p_over(2.5),       4),
+        "prob_under25":     round(1 - p_over(2.5),   4),
+        "prob_over35":      round(p_over(3.5),       4),
+        "prob_under35":     round(1 - p_over(3.5),   4),
+        "prob_over45":      round(p_over(4.5),       4),
+        "prob_under45":     round(1 - p_over(4.5),   4),
+        "prob_home_over05": round(float(home_pmf[1:].sum()),   4),
+        "prob_home_under05":round(float(home_pmf[0]),          4),
+        "prob_home_over15": round(float(home_pmf[2:].sum()),   4),
+        "prob_home_under15":round(float(home_pmf[:2].sum()),   4),
+        "prob_away_over05": round(float(away_pmf[1:].sum()),   4),
+        "prob_away_under05":round(float(away_pmf[0]),          4),
+        "prob_away_over15": round(float(away_pmf[2:].sum()),   4),
+        "prob_away_under15":round(float(away_pmf[:2].sum()),   4),
+        "prob_exact_0":     round(p_exact[0],          4),
+        "prob_exact_1":     round(p_exact[1],          4),
+        "prob_exact_2":     round(p_exact[2],          4),
+        "prob_exact_3":     round(p_exact[3],          4),
+        "prob_exact_4plus": round(p_exact["4plus"],    4),
+        "prob_home_and_btts": round(p_home_btts,       4),
+        "prob_draw_and_btts": round(p_draw_btts,       4),
+        "prob_away_and_btts": round(p_away_btts,       4),
+        "prob_double_1x":   round(p_home + p_draw,     4),
+        "prob_double_x2":   round(p_draw + p_away,     4),
+        "prob_double_12":   round(p_home + p_away,     4),
+        "prob_ah_home_minus05": round(p_ah_home_minus05, 4),
+        "prob_ah_away_minus05": round(p_ah_away_minus05, 4),
+        "prob_ah_home_plus05":  round(p_ah_home_plus05,  4),
+        "prob_ah_away_plus05":  round(p_ah_away_plus05,  4),
+        "prob_ah_home_minus1":  round(p_ah_home_minus1,  4),
+        "prob_ah_away_minus1":  round(p_ah_away_minus1,  4),
+        "exp_home_goals":   round(mu,       2),
+        "exp_away_goals":   round(lam,      2),
+        "exp_total_goals":  round(mu + lam, 2),
+    }
+
+
+def _compute_ah_prob_from_spread(spread_line: float,
+                                  mu: float, lam: float) -> tuple[float, float]:
+    """
+    Calcula P(home cubre) y P(away cubre) para un spread real ESPN.
+
+    Para spread = -1.5: local gana por 2+
+    Para spread = -0.5: local gana (sin empate)
+    Para spread = +0.5: local gana o empata
+    etc.
+
+    Retorna (prob_home_covers, prob_away_covers).
+    """
+    M   = _poisson_matrix(mu, lam)
+    n   = MAX_GOALS
+    # El spread en ESPN es desde la perspectiva del local:
+    # spread = -1.5 significa local -1.5 (necesita ganar por 2+)
+    # La condición home_score - away_score > -spread
+    threshold = -spread_line  # umbral: diferencia de goles que necesita local
+
+    p_home_covers = float(sum(
+        M[i][j] for i in range(n+1) for j in range(n+1)
+        if (i - j) > threshold - 0.001   # pequeña tolerancia floating point
+    ))
+    # En AH el empate en el spread es push (devuelve), así que:
+    # si threshold es entero, hay que manejar el push
+    is_integer_spread = abs(threshold - round(threshold)) < 0.01
+    if is_integer_spread:
+        # Push si la diferencia es exactamente threshold — se divide al 50%
+        p_push = float(sum(
+            M[i][j] for i in range(n+1) for j in range(n+1)
+            if abs((i - j) - threshold) < 0.01
+        ))
+        p_home_covers = float(sum(
+            M[i][j] for i in range(n+1) for j in range(n+1)
+            if (i - j) > threshold + 0.01
+        )) + p_push * 0.5
+    p_away_covers = 1.0 - p_home_covers
+
+    return round(p_home_covers, 4), round(p_away_covers, 4)
+
+
 # ─── CUOTAS HISTÓRICAS (Football-Data.co.uk) ─────────────────────────────────
 
-def _get_odds_columns(df: pd.DataFrame) -> list[tuple[str, str, str]]:
+def _get_odds_columns(df: pd.DataFrame) -> list[tuple]:
     candidates = [
-        ("PSH",   "PSD",   "PSA"),
-        ("B365H", "B365D", "B365A"),
-        ("BWH",   "BWD",   "BWA"),
-        ("WHH",   "WHD",   "WHA"),
-        ("VCH",   "VCD",   "VCA"),
+        ("PSH", "PSD", "PSA"), ("B365H", "B365D", "B365A"), ("BWH", "BWD", "BWA"),
     ]
-    return [
-        (h, d, a) for h, d, a in candidates
-        if all(c in df.columns for c in [h, d, a])
-    ]
+    return [(h, d, a) for h, d, a in candidates
+            if all(c in df.columns for c in [h, d, a])]
 
 
-def _extract_odds_from_row(row: pd.Series,
-                            odds_cols: list[tuple]) -> dict | None:
+def _extract_odds_from_row(row: pd.Series, odds_cols: list) -> dict | None:
     for col_h, col_d, col_a in odds_cols:
         try:
-            h_odd = float(row[col_h])
-            d_odd = float(row[col_d])
-            a_odd = float(row[col_a])
-            if h_odd > 1.0 and d_odd > 1.0 and a_odd > 1.0:
-                over25  = None
-                under25 = None
+            h = float(row[col_h]); d = float(row[col_d]); a = float(row[col_a])
+            if h > 1.0 and d > 1.0 and a > 1.0:
+                over25  = None; under25 = None
                 if "B365>2.5" in row.index:
-                    try:    over25  = float(row["B365>2.5"])
+                    try: over25  = float(row["B365>2.5"])
                     except: pass
                 if "B365<2.5" in row.index:
-                    try:    under25 = float(row["B365<2.5"])
+                    try: under25 = float(row["B365<2.5"])
                     except: pass
-                return {
-                    "home":    h_odd,
-                    "draw":    d_odd,
-                    "away":    a_odd,
-                    "over25":  over25,
-                    "under25": under25,
-                    "source":  col_h[:3],
-                }
+                return {"home": h, "draw": d, "away": a,
+                        "over25": over25, "under25": under25, "source": col_h[:3]}
         except (ValueError, TypeError, KeyError):
             continue
     return None
@@ -116,11 +276,6 @@ def _extract_odds_from_row(row: pd.Series,
 
 def get_current_season_odds(home_team: str, away_team: str,
                              historical: pd.DataFrame) -> dict | None:
-    """
-    Estrategia de cuotas históricas (Football-Data.co.uk):
-    1. Partido exacto más reciente
-    2. Promedio contextual (últimos N partidos en casa del local + fuera del visitante)
-    """
     if historical is None or historical.empty:
         return None
     if "home_team_norm" not in historical.columns:
@@ -132,174 +287,239 @@ def get_current_season_odds(home_team: str, away_team: str,
     if not odds_cols:
         return None
 
-    # ── Estrategia 1: partido exacto ─────────────────────────────────────
-    mask_exact = (
-        (historical["home_team_norm"] == h_norm) &
-        (historical["away_team_norm"] == a_norm)
-    )
-    exact = historical[mask_exact].sort_values("match_date", ascending=False)
-
+    # Exacto
+    mask   = (historical["home_team_norm"] == h_norm) & (historical["away_team_norm"] == a_norm)
+    exact  = historical[mask].sort_values("match_date", ascending=False)
     if not exact.empty:
         result = _extract_odds_from_row(exact.iloc[0], odds_cols)
         if result:
             result["method"] = "exact_match"
             return result
 
-    # ── Estrategia 2: promedio contextual ────────────────────────────────
-    home_home = historical[
-        historical["home_team_norm"] == h_norm
-    ].sort_values("match_date", ascending=False).head(_N_RECENT_CONTEXT)
-
-    away_away = historical[
-        historical["away_team_norm"] == a_norm
-    ].sort_values("match_date", ascending=False).head(_N_RECENT_CONTEXT)
+    # Contextual
+    home_home = historical[historical["home_team_norm"] == h_norm]\
+        .sort_values("match_date", ascending=False).head(_N_RECENT_CONTEXT)
+    away_away = historical[historical["away_team_norm"] == a_norm]\
+        .sort_values("match_date", ascending=False).head(_N_RECENT_CONTEXT)
 
     if home_home.empty or away_away.empty:
         return None
 
-    home_odds_list = []
-    away_odds_list = []
-
+    hl, al = [], []
     for _, row in home_home.iterrows():
         o = _extract_odds_from_row(row, odds_cols)
-        if o:
-            home_odds_list.append(o["home"])
-
+        if o: hl.append(o["home"])
     for _, row in away_away.iterrows():
         o = _extract_odds_from_row(row, odds_cols)
-        if o:
-            away_odds_list.append(o["away"])
-
-    if not home_odds_list or not away_odds_list:
+        if o: al.append(o["away"])
+    if not hl or not al:
         return None
 
-    avg_home_odds = float(np.mean(home_odds_list))
-    avg_away_odds = float(np.mean(away_odds_list))
+    avg_h = float(np.mean(hl)); avg_a = float(np.mean(al))
+    p_h = (1/avg_h)*0.95; p_a = (1/avg_a)*0.95
+    p_d = max(0.05, 1.0 - p_h - p_a); total = p_h + p_d + p_a
+    draw_odds = round(1 / (p_d / total), 3)
 
-    p_home = (1 / avg_home_odds) * 0.95
-    p_away = (1 / avg_away_odds) * 0.95
-    p_draw = max(0.05, 1.0 - p_home - p_away)
-    total  = p_home + p_draw + p_away
-    p_home /= total
-    p_draw /= total
-    p_away /= total
-    draw_odds = round(1 / p_draw, 3) if p_draw > 0 else 3.40
-
-    over25_list  = []
-    under25_list = []
+    over25_list, under25_list = [], []
     for _, row in home_home.iterrows():
         if "B365>2.5" in row.index:
-            try:    over25_list.append(float(row["B365>2.5"]))
+            try: over25_list.append(float(row["B365>2.5"]))
             except: pass
         if "B365<2.5" in row.index:
-            try:    under25_list.append(float(row["B365<2.5"]))
+            try: under25_list.append(float(row["B365<2.5"]))
             except: pass
 
     return {
-        "home":    round(avg_home_odds, 3),
-        "draw":    draw_odds,
-        "away":    round(avg_away_odds, 3),
+        "home":    round(avg_h, 3), "draw":    draw_odds, "away":    round(avg_a, 3),
         "over25":  round(float(np.mean(over25_list)),  3) if over25_list  else None,
         "under25": round(float(np.mean(under25_list)), 3) if under25_list else None,
-        "source":  "contextual",
-        "method":  "contextual_avg",
-        "n_home":  len(home_odds_list),
-        "n_away":  len(away_odds_list),
+        "source":  "contextual", "method": "contextual_avg",
     }
 
 
-# ─── CUOTAS ESPN EN TIEMPO REAL ───────────────────────────────────────────────
+# ─── CONSTRUCCIÓN DE CUOTAS ───────────────────────────────────────────────────
 
-def _get_espn_odds_from_fixture(fixture_row: pd.Series) -> dict | None:
-    """
-    Extrae cuotas ESPN en tiempo real del fixture_row si están disponibles.
-    Estas cuotas se añadieron en build_features_for_fixtures via enrich_fixtures_with_odds.
-    """
-    if not fixture_row.get("espn_odds_available"):
-        return None
-
-    h = fixture_row.get("espn_odds_home")
-    d = fixture_row.get("espn_odds_draw")
-    a = fixture_row.get("espn_odds_away")
-
-    if not h or not a or float(h) <= 1.0:
-        return None
-
-    return {
-        "home":    float(h),
-        "draw":    float(d) if d else 3.40,
-        "away":    float(a),
-        "over25":  None,
-        "under25": None,
-        "source":  "espn_odds",
-        "method":  "espn_live",
-        "provider": fixture_row.get("espn_odds_provider", "ESPN"),
-    }
+def _fair_to_market(prob: float, overround: float = 0.05) -> float:
+    """Cuota fair con overround. Mínimo 1.01."""
+    if prob <= 0: return 99.0
+    return round(max(1.01, (1 / prob) * (1 - overround)), 3)
 
 
-# ─── CONSTRUCCIÓN UNIFICADA DE CUOTAS ────────────────────────────────────────
+def _double_chance_odds(odds_a: float, odds_b: float,
+                        overround: float = 0.95) -> float:
+    if not odds_a or not odds_b or odds_a <= 1.0 or odds_b <= 1.0:
+        return 1.10
+    fair_prob = (1/odds_a) + (1/odds_b)
+    if fair_prob >= 1.0:
+        return round(overround, 2)
+    return round((1/fair_prob) * overround, 3)
+
 
 def build_odds_dict(home_team: str, away_team: str,
                     historical: pd.DataFrame,
-                    fixture_row: pd.Series = None) -> tuple[dict, bool, str]:
+                    fixture_row: pd.Series,
+                    market_probs: dict) -> tuple[dict, bool, str]:
     """
-    Construye el diccionario de cuotas para un partido con 3 niveles:
+    Construye cuotas para todos los mercados con 3 niveles.
 
-    Nivel 1 — ESPN en tiempo real (mejor): cuotas del día del mercado.
-    Nivel 2 — Football-Data.co.uk (bueno): cierre histórico real.
-    Nivel 3 — Fallback estimado (peor): usar con umbrales más altos.
+    Nivel 1 — ESPN real (mejor):
+        1a. 1X2 → moneyLine convertido a decimal
+        1b. Over/Under → overOdds/underOdds sobre espn_total_line
+            Si la línea ESPN ≠ 2.5, adapta la probabilidad del modelo
+            para esa línea específica.
+        1c. AH/Spread → spreadOdds sobre espn_spread_line real
 
-    Retorna (odds_dict, son_reales, método).
+    Nivel 2 — Football-Data.co.uk (bueno):
+        Solo 1X2 y Over/Under 2.5.
+
+    Nivel 3 — model_implied (solo para mercados nicho):
+        Cuota fair derivada del modelo con overround 5%.
+        Mercados estándar bloqueados.
+
+    Retorna (odds_dict, tiene_cuotas_reales_1x2, método).
     """
-    # ── Nivel 1: ESPN tiempo real ─────────────────────────────────────────
-    if fixture_row is not None:
-        espn_odds = _get_espn_odds_from_fixture(fixture_row)
-        if espn_odds:
-            h_odds = espn_odds["home"]
-            d_odds = espn_odds["draw"]
-            a_odds = espn_odds["away"]
-            odds = {
-                "home_win":  h_odds,
-                "draw":      d_odds,
-                "away_win":  a_odds,
-                "btts_si":   CUOTAS_FALLBACK["btts_si"],
-                "btts_no":   CUOTAS_FALLBACK["btts_no"],
-                "over25":    espn_odds.get("over25")  or CUOTAS_FALLBACK["over25"],
-                "under25":   espn_odds.get("under25") or CUOTAS_FALLBACK["under25"],
-                "double_1x": _double_chance_odds(h_odds, d_odds),
-                "double_x2": _double_chance_odds(d_odds, a_odds),
-                "double_12": _double_chance_odds(h_odds, a_odds),
-            }
+    # Base: cuotas derivadas del modelo para TODOS los mercados
+    model_odds = {
+        mkt: _fair_to_market(market_probs.get(f"prob_{mkt}", 0))
+        for mkt in [
+            "home_win", "draw", "away_win",
+            "btts_si", "btts_no",
+            "over05", "under05", "over15", "under15",
+            "over25", "under25", "over35", "under35", "over45", "under45",
+            "home_over05", "home_under05", "home_over15", "home_under15",
+            "away_over05", "away_under05", "away_over15", "away_under15",
+            "exact_0", "exact_1", "exact_2", "exact_3", "exact_4plus",
+            "home_and_btts", "draw_and_btts", "away_and_btts",
+            "double_1x", "double_x2", "double_12",
+            "ah_home_minus05", "ah_away_minus05",
+            "ah_home_plus05",  "ah_away_plus05",
+            "ah_home_minus1",  "ah_away_minus1",
+        ]
+    }
+
+    # ── Nivel 1: ESPN real ────────────────────────────────────────────────
+    if fixture_row.get("espn_odds_available"):
+        h_odd = fixture_row.get("espn_odds_home")
+        d_odd = fixture_row.get("espn_odds_draw")
+        a_odd = fixture_row.get("espn_odds_away")
+
+        if h_odd and a_odd and float(h_odd) > 1.0:
+            odds = model_odds.copy()
+
+            # 1a — 1X2
+            odds["home_win"] = float(h_odd)
+            odds["draw"]     = float(d_odd) if d_odd else model_odds["draw"]
+            odds["away_win"] = float(a_odd)
+            odds["double_1x"] = _double_chance_odds(float(h_odd), odds["draw"])
+            odds["double_x2"] = _double_chance_odds(odds["draw"], float(a_odd))
+            odds["double_12"] = _double_chance_odds(float(h_odd), float(a_odd))
+
+            # 1b — Over/Under con línea real
+            total_line = fixture_row.get("espn_total_line")
+            over_dec   = fixture_row.get("espn_over_odds")
+            under_dec  = fixture_row.get("espn_under_odds")
+
+            if total_line is not None and over_dec and under_dec:
+                line = float(total_line)
+                # Mapear la línea al mercado más cercano que tenemos
+                line_to_mkt = {0.5: ("over05", "under05"), 1.5: ("over15", "under15"),
+                               2.5: ("over25", "under25"), 3.5: ("over35", "under35"),
+                               4.5: ("over45", "under45")}
+                # Cuota real para la línea exacta
+                mkt_over, mkt_under = line_to_mkt.get(line, ("over25", "under25"))
+                odds[mkt_over]  = float(over_dec)
+                odds[mkt_under] = float(under_dec)
+            elif over_dec and under_dec:
+                # Sin línea explícita, asumir 2.5
+                odds["over25"]  = float(over_dec)
+                odds["under25"] = float(under_dec)
+
+            # 1c — Spread / Asian Handicap real
+            spread_line = fixture_row.get("espn_spread_line")
+            sh_odds     = fixture_row.get("espn_spread_home_odds")
+            sa_odds     = fixture_row.get("espn_spread_away_odds")
+
+            if spread_line is not None and sh_odds and sa_odds:
+                sl = float(spread_line)
+                # Mapear spread a mercado AH más cercano
+                if abs(sl - (-0.5)) < 0.3:
+                    odds["ah_home_minus05"] = float(sh_odds)
+                    odds["ah_away_plus05"]  = float(sa_odds)
+                elif abs(sl - 0.5) < 0.3:
+                    odds["ah_home_plus05"]  = float(sh_odds)
+                    odds["ah_away_minus05"] = float(sa_odds)
+                elif sl <= -0.9:  # -1 o más
+                    odds["ah_home_minus1"]  = float(sh_odds)
+                    odds["ah_away_minus1"]  = float(sa_odds)
+
             return odds, True, "espn_live"
 
-    # ── Nivel 2: Football-Data.co.uk histórico ───────────────────────────
+    # ── Nivel 2: Football-Data.co.uk ──────────────────────────────────────
     real = None
     if historical is not None and not historical.empty:
         try:
             real = get_current_season_odds(home_team, away_team, historical)
-        except Exception as e:
-            log.debug(f"Error cuotas históricas {home_team}: {e}")
+        except Exception:
+            pass
 
     if real:
-        h_odds = real["home"]
-        d_odds = real["draw"]
-        a_odds = real["away"]
-        odds = {
-            "home_win":  h_odds,
-            "draw":      d_odds,
-            "away_win":  a_odds,
-            "btts_si":   CUOTAS_FALLBACK["btts_si"],
-            "btts_no":   CUOTAS_FALLBACK["btts_no"],
-            "over25":    real.get("over25")  or CUOTAS_FALLBACK["over25"],
-            "under25":   real.get("under25") or CUOTAS_FALLBACK["under25"],
-            "double_1x": _double_chance_odds(h_odds, d_odds),
-            "double_x2": _double_chance_odds(d_odds, a_odds),
-            "double_12": _double_chance_odds(h_odds, a_odds),
-        }
+        odds = model_odds.copy()
+        odds["home_win"] = real["home"]
+        odds["draw"]     = real["draw"]
+        odds["away_win"] = real["away"]
+        odds["double_1x"] = _double_chance_odds(real["home"], real["draw"])
+        odds["double_x2"] = _double_chance_odds(real["draw"], real["away"])
+        odds["double_12"] = _double_chance_odds(real["home"], real["away"])
+        if real.get("over25"):  odds["over25"]  = real["over25"]
+        if real.get("under25"): odds["under25"] = real["under25"]
         return odds, True, real.get("method", "fd_historical")
 
-    # ── Nivel 3: Fallback estimado ────────────────────────────────────────
-    return CUOTAS_FALLBACK.copy(), False, "fallback"
+    # ── Nivel 3: model_implied ────────────────────────────────────────────
+    return model_odds, False, "model_implied"
+
+
+# ─── CLASIFICACIÓN DE CONFIANZA ───────────────────────────────────────────────
+
+def classify_confidence(edge: float, model_prob: float,
+                        n_home: int, n_away: int,
+                        odds_method: str,
+                        market: str) -> str | None:
+    """
+    Clasifica confianza con lógica diferenciada por fuente y tipo de mercado.
+
+    Con cuotas reales (ESPN o fd.co.uk): umbrales estándar para todos los mercados.
+    Con model_implied:
+      - Mercados estándar (1X2, Over/Under 2.5): BLOQUEADOS siempre.
+      - Mercados nicho: umbral elevado (+4pp) y prob mínima 65%.
+    """
+    is_real = odds_method in ("espn_live", "exact_match", "contextual_avg", "fd_historical")
+
+    if odds_method == "model_implied":
+        # Bloquear mercados estándar completamente
+        if market in _MERCADOS_BLOQUEADOS_MODEL_IMPLIED:
+            return None
+        # Mercados nicho: umbral elevado
+        edge_alta  = _EDGE_NICHO_ALTA
+        edge_media = _EDGE_NICHO_MEDIA
+        prob_min   = _PROB_NICHO
+    elif is_real:
+        edge_alta  = UMBRAL_EDGE_ALTA
+        edge_media = UMBRAL_EDGE_MEDIA
+        prob_min   = UMBRAL_PROB_MEDIA
+    else:
+        edge_alta  = UMBRAL_EDGE_ALTA_ESPN
+        edge_media = UMBRAL_EDGE_MEDIA_ESPN
+        prob_min   = UMBRAL_PROB_MEDIA
+
+    if (edge >= edge_alta and model_prob >= UMBRAL_PROB_ALTA and
+        n_home >= MIN_PARTIDOS_ALTA and n_away >= MIN_PARTIDOS_ALTA):
+        return "alta"
+
+    if (edge >= edge_media and model_prob >= prob_min and
+        n_home >= MIN_PARTIDOS_MEDIA and n_away >= MIN_PARTIDOS_MEDIA):
+        return "media"
+
+    return None
 
 
 # ─── CÁLCULOS CORE ───────────────────────────────────────────────────────────
@@ -319,119 +539,126 @@ def kelly_fraction(model_prob: float, decimal_odds: float,
     return round(max(kelly * fraction, 0.0) * 100, 2)
 
 
-def _double_chance_odds(odds_a: float, odds_b: float,
-                        overround: float = 0.95) -> float:
-    if not odds_a or not odds_b or odds_a <= 1.0 or odds_b <= 1.0:
-        return 1.10
-    fair_prob = (1 / odds_a) + (1 / odds_b)
-    if fair_prob >= 1.0:
-        return round(overround, 2)
-    return round((1 / fair_prob) * overround, 3)
+def get_model_prob_for_market(market: str, market_probs: dict) -> float:
+    return market_probs.get(f"prob_{market}", 0.0)
 
 
-def get_model_prob_for_market(market: str, predictions: dict) -> float:
-    if market == "double_1x":
-        return predictions.get("prob_home_win", 0) + predictions.get("prob_draw", 0)
-    if market == "double_x2":
-        return predictions.get("prob_draw", 0) + predictions.get("prob_away_win", 0)
-    if market == "double_12":
-        return predictions.get("prob_home_win", 0) + predictions.get("prob_away_win", 0)
-    if market == "btts_no":
-        return 1 - predictions.get("prob_btts", 0.5)
-    if market == "under25":
-        return 1 - predictions.get("prob_over25", 0.5)
-    key = MARKET_TO_PROB.get(market)
-    return predictions.get(key, 0) if key else 0
+def build_explanation(market: str, fixture_row: dict,
+                      market_probs: dict, top_features: list) -> str:
+    mu  = market_probs.get("exp_home_goals", 0)
+    lam = market_probs.get("exp_away_goals", 0)
 
-
-def classify_confidence(edge: float, model_prob: float,
-                        n_home: int, n_away: int,
-                        odds_method: str = "fd_historical") -> str | None:
-    """
-    Clasifica la confianza de una apuesta.
-
-    FIX v4: n_home y n_away deben ser n_matches_total (no el conteo de ventana).
-    Los umbrales de edge se elevan para ligas sin cuotas reales (fallback).
-    """
-    # Umbrales según calidad de cuotas
-    if odds_method == "espn_live":
-        # Cuotas en tiempo real — umbrales estándar
-        edge_alta  = UMBRAL_EDGE_ALTA
-        edge_media = UMBRAL_EDGE_MEDIA
-    elif odds_method in ("exact_match", "contextual_avg", "fd_historical"):
-        # Cuotas históricas reales — umbrales estándar
-        edge_alta  = UMBRAL_EDGE_ALTA
-        edge_media = UMBRAL_EDGE_MEDIA
-    else:
-        # Fallback estimado — umbrales más altos (más conservador)
-        edge_alta  = UMBRAL_EDGE_ALTA_ESPN
-        edge_media = UMBRAL_EDGE_MEDIA_ESPN
-
-    if (edge >= edge_alta and
-        model_prob >= UMBRAL_PROB_ALTA and
-        n_home >= MIN_PARTIDOS_ALTA and
-        n_away >= MIN_PARTIDOS_ALTA):
-        return "alta"
-
-    if (edge >= edge_media and
-        model_prob >= UMBRAL_PROB_MEDIA and
-        n_home >= MIN_PARTIDOS_MEDIA and
-        n_away >= MIN_PARTIDOS_MEDIA):
-        return "media"
-
-    return None
-
-
-def build_explanation(market: str, features_row: dict,
-                       top_features: list) -> str:
-    templates = {
-        "home_xg_scored":    lambda v: f"xG ofensivo local {v:.2f}",
-        "away_xg_scored":    lambda v: f"xG ofensivo visitante {v:.2f}",
-        "home_xg_conceded":  lambda v: f"xG concedido local {v:.2f}",
-        "away_xg_conceded":  lambda v: f"xG concedido visitante {v:.2f}",
-        "home_forma":        lambda v: f"forma local {v:.1f} pts/PJ",
-        "away_forma":        lambda v: f"forma visitante {v:.1f} pts/PJ",
-        "elo_diff":          lambda v: f"ventaja ELO {abs(v):.0f} pts ({'local' if v>0 else 'visitante'})",
-        "h2h_btts_rate":     lambda v: f"BTTS en {v*100:.0f}% H2H",
-        "h2h_avg_goals":     lambda v: f"promedio {v:.1f} goles H2H",
-        "xg_total_exp":      lambda v: f"xG total {v:.2f}",
-        "home_days_rest":    lambda v: f"local {v:.0f}d descanso",
-        "away_days_rest":    lambda v: f"visitante {v:.0f}d descanso",
-        "fatiga_flag":       lambda v: "fatiga detectada (<4d)" if v else "",
-        "rain_flag":         lambda v: "lluvia prevista" if v else "",
-        "home_over25_rate":  lambda v: f"local Over2.5 en {v*100:.0f}%",
-        "away_over25_rate":  lambda v: f"visitante Over2.5 en {v*100:.0f}%",
+    base = {
+        "over05":        f"modelo espera {mu+lam:.1f} goles totales",
+        "over15":        f">{1.5} goles — modelo espera {mu+lam:.1f}",
+        "over25":        f"modelo espera {mu+lam:.1f} goles ({mu:.1f}+{lam:.1f})",
+        "under25":       f"solo {mu+lam:.1f} goles esperados en total",
+        "over35":        f">{3.5} goles — modelo espera {mu+lam:.1f}",
+        "over45":        f">{4.5} goles — modelo espera {mu+lam:.1f}",
+        "btts_si":       f"local {mu:.1f} esp. | visitante {lam:.1f} esp.",
+        "btts_no":       f"uno de los dos equipos podría no marcar",
+        "home_over05":   f"local espera {mu:.1f} goles",
+        "away_over05":   f"visitante espera {lam:.1f} goles",
+        "home_over15":   f"local necesita 2+ — espera {mu:.1f}",
+        "away_over15":   f"visitante necesita 2+ — espera {lam:.1f}",
+        "home_under05":  f"local espera solo {mu:.1f} goles",
+        "away_under05":  f"visitante espera solo {lam:.1f} goles",
+        "exact_0":       f"0-0 — {mu+lam:.1f} goles esperados es bajo",
+        "exact_1":       f"exactamente 1 gol — prob. calculada desde DC",
+        "exact_2":       f"exactamente 2 goles — prob. calculada desde DC",
+        "exact_3":       f"exactamente 3 goles — prob. calculada desde DC",
+        "exact_4plus":   f"4+ goles — modelo espera {mu+lam:.1f}",
+        "home_and_btts": f"local gana Y ambos marcan — {mu:.1f} vs {lam:.1f} esp.",
+        "away_and_btts": f"visitante gana Y ambos marcan — {lam:.1f} vs {mu:.1f} esp.",
+        "draw_and_btts": f"empate Y ambos marcan — {mu:.1f} vs {lam:.1f} esp.",
+        "ah_home_minus05": f"local gana (AH -0.5) — espera {mu:.1f} goles",
+        "ah_away_minus05": f"visitante gana (AH -0.5) — espera {lam:.1f} goles",
+        "ah_home_plus05":  f"local gana o empata (AH +0.5)",
+        "ah_away_plus05":  f"visitante gana o empata (AH +0.5)",
+        "ah_home_minus1":  f"local gana por 2+ (AH -1) — espera {mu:.1f}",
     }
-    parts = []
-    for feat in top_features[:3]:
-        val = features_row.get(feat)
+
+    templates = {
+        "home_forma":       lambda v: f"forma local {v:.1f}pts/PJ",
+        "away_forma":       lambda v: f"forma visitante {v:.1f}pts/PJ",
+        "elo_diff":         lambda v: f"ventaja ELO {abs(v):.0f}pts {'(L)' if v>0 else '(V)'}",
+        "h2h_avg_goals":    lambda v: f"H2H promedio {v:.1f} goles",
+        "h2h_btts_rate":    lambda v: f"BTTS en {v*100:.0f}% de H2H",
+        "home_over25_rate": lambda v: f"local Over2.5 en {v*100:.0f}%",
+        "away_over25_rate": lambda v: f"visit. Over2.5 en {v*100:.0f}%",
+        "home_days_rest":   lambda v: f"local {v:.0f}d descanso",
+        "away_days_rest":   lambda v: f"visitante {v:.0f}d descanso",
+        "fatiga_flag":      lambda v: "fatiga (<4d)" if v else "",
+    }
+
+    parts = [base.get(market, "")]
+    for feat in (top_features or [])[:2]:
+        val = fixture_row.get(feat)
         if val is not None and feat in templates:
             try:
-                text = templates[feat](float(val))
-                if text:
-                    parts.append(text)
+                txt = templates[feat](float(val))
+                if txt and txt not in parts:
+                    parts.append(txt)
             except Exception:
                 pass
-    return " | ".join(parts) or "análisis estadístico del equipo"
+    return " | ".join(p for p in parts if p) or "análisis estadístico"
 
 
-def _compute_edge_vs_market(model_prob: float,
-                             fixture_row: pd.Series,
-                             market: str) -> float | None:
-    market_col = {
-        "home_win": "market_prob_home",
-        "draw":     "market_prob_draw",
-        "away_win": "market_prob_away",
-    }.get(market)
+# ─── TODOS LOS MERCADOS ───────────────────────────────────────────────────────
 
-    if not market_col:
-        return None
+ALL_MARKETS = [
+    "home_win", "draw", "away_win",
+    "btts_si", "btts_no",
+    "over15", "under15", "over25", "under25", "over35", "under35", "over45",
+    "home_over05", "home_under05", "home_over15", "home_under15",
+    "away_over05", "away_under05", "away_over15", "away_under15",
+    "exact_0", "exact_1", "exact_2", "exact_3", "exact_4plus",
+    "home_and_btts", "away_and_btts", "draw_and_btts",
+    "double_1x", "double_x2", "double_12",
+    "ah_home_minus05", "ah_away_minus05",
+    "ah_home_plus05",  "ah_away_plus05",
+    "ah_home_minus1",  "ah_away_minus1",
+]
 
-    market_prob = fixture_row.get(market_col)
-    if market_prob is None or market_prob <= 0:
-        return None
-
-    return round((model_prob - float(market_prob)) * 100, 2)
+MARKET_DISPLAY = {
+    "home_win":         lambda h, a: f"Victoria {h}",
+    "draw":             lambda h, a: "Empate",
+    "away_win":         lambda h, a: f"Victoria {a}",
+    "btts_si":          lambda h, a: "Ambos marcan — SÍ",
+    "btts_no":          lambda h, a: "Ambos marcan — NO",
+    "over15":           lambda h, a: "Over 1.5 goles",
+    "under15":          lambda h, a: "Under 1.5 goles",
+    "over25":           lambda h, a: "Over 2.5 goles",
+    "under25":          lambda h, a: "Under 2.5 goles",
+    "over35":           lambda h, a: "Over 3.5 goles",
+    "under35":          lambda h, a: "Under 3.5 goles",
+    "over45":           lambda h, a: "Over 4.5 goles",
+    "home_over05":      lambda h, a: f"{h} marca 1+ goles",
+    "home_under05":     lambda h, a: f"{h} no marca",
+    "home_over15":      lambda h, a: f"{h} marca 2+ goles",
+    "home_under15":     lambda h, a: f"{h} marca 0 ó 1 gol",
+    "away_over05":      lambda h, a: f"{a} marca 1+ goles",
+    "away_under05":     lambda h, a: f"{a} no marca",
+    "away_over15":      lambda h, a: f"{a} marca 2+ goles",
+    "away_under15":     lambda h, a: f"{a} marca 0 ó 1 gol",
+    "exact_0":          lambda h, a: "Goles exactos: 0 (0-0)",
+    "exact_1":          lambda h, a: "Goles exactos: 1",
+    "exact_2":          lambda h, a: "Goles exactos: 2",
+    "exact_3":          lambda h, a: "Goles exactos: 3",
+    "exact_4plus":      lambda h, a: "4 o más goles en total",
+    "home_and_btts":    lambda h, a: f"{h} gana + ambos marcan",
+    "draw_and_btts":    lambda h, a: "Empate + ambos marcan",
+    "away_and_btts":    lambda h, a: f"{a} gana + ambos marcan",
+    "double_1x":        lambda h, a: f"Doble: {h} o Empate",
+    "double_x2":        lambda h, a: f"Doble: Empate o {a}",
+    "double_12":        lambda h, a: f"Doble: {h} o {a}",
+    "ah_home_minus05":  lambda h, a: f"AH: {h} -0.5",
+    "ah_away_minus05":  lambda h, a: f"AH: {a} -0.5",
+    "ah_home_plus05":   lambda h, a: f"AH: {h} +0.5",
+    "ah_away_plus05":   lambda h, a: f"AH: {a} +0.5",
+    "ah_home_minus1":   lambda h, a: f"AH: {h} -1 (gana por 2+)",
+    "ah_away_minus1":   lambda h, a: f"AH: {a} -1 (gana por 2+)",
+}
 
 
 # ─── ANALIZADOR PRINCIPAL ────────────────────────────────────────────────────
@@ -440,83 +667,93 @@ def analyze_fixture(fixture_row: pd.Series, predictions: dict,
                     historical: pd.DataFrame = None) -> list:
     home   = fixture_row.get("home_team", "")
     away   = fixture_row.get("away_team", "")
-
-    # FIX: usar n_matches_total para classify_confidence
     n_home = int(fixture_row.get("n_home_matches", 0))
     n_away = int(fixture_row.get("n_away_matches", 0))
 
+    # Goles esperados de Dixon-Coles
+    mu  = predictions.get("dc_exp_home_goals", 1.4)
+    lam = predictions.get("dc_exp_away_goals", 1.1)
+
+    # Probabilidades Poisson para todos los mercados
+    market_probs = compute_all_market_probs(mu, lam)
+
+    # Sobreescribir mercados principales con el blend DC+XGBoost
+    # (más preciso que Poisson puro para 1X2, BTTS, Over/Under 2.5)
+    for blend_key in ["prob_home_win", "prob_draw", "prob_away_win",
+                       "prob_btts", "prob_over25", "prob_under25"]:
+        if blend_key in predictions:
+            market_probs[blend_key] = predictions[blend_key]
+
+    # Si hay spread real ESPN, recalcular probs AH con ese spread
+    spread_line = fixture_row.get("espn_spread_line")
+    if spread_line is not None:
+        p_h_covers, p_a_covers = _compute_ah_prob_from_spread(
+            float(spread_line), mu, lam
+        )
+        sl = float(spread_line)
+        if abs(sl - (-0.5)) < 0.3:
+            market_probs["prob_ah_home_minus05"] = p_h_covers
+            market_probs["prob_ah_away_plus05"]  = p_a_covers
+        elif abs(sl - 0.5) < 0.3:
+            market_probs["prob_ah_home_plus05"]  = p_h_covers
+            market_probs["prob_ah_away_minus05"] = p_a_covers
+        elif sl <= -0.9:
+            market_probs["prob_ah_home_minus1"]  = p_h_covers
+            market_probs["prob_ah_away_minus1"]  = p_a_covers
+
+    # Construir cuotas
     reference_odds, odds_are_real, odds_method = build_odds_dict(
-        home, away, historical, fixture_row
+        home, away, historical, fixture_row, market_probs
     )
 
-    log.debug(
-        f"{home} vs {away}: cuotas {odds_method} "
-        f"({'real' if odds_are_real else 'estimada'})"
-    )
-
-    markets_to_check = ["home_win", "away_win", "btts_si", "over25"]
-    if n_home >= MIN_PARTIDOS_ALTA and n_away >= MIN_PARTIDOS_ALTA:
-        markets_to_check += ["draw", "double_1x", "double_x2"]
+    top_features = predictions.get("top_features", {})
 
     bets = []
-    for market in markets_to_check:
-        model_prob = get_model_prob_for_market(market, predictions)
-        if model_prob <= 0:
+    for market in ALL_MARKETS:
+        model_prob = get_model_prob_for_market(market, market_probs)
+        if model_prob <= 0.01:
             continue
 
-        odds       = reference_odds.get(market, CUOTAS_FALLBACK.get(market, 2.0))
+        odds = reference_odds.get(market)
+        if odds is None or odds <= 1.0:
+            continue
+
         edge       = calculate_edge(model_prob, odds)
-
-        # FIX: pasar odds_method a classify_confidence para umbrales dinámicos
-        confidence = classify_confidence(edge, model_prob, n_home, n_away, odds_method)
-
-        # Descartar media si cuotas son fallback (sin datos de mercado reales)
-        if not odds_are_real and confidence == "media":
-            confidence = None
+        confidence = classify_confidence(
+            edge, model_prob, n_home, n_away, odds_method, market
+        )
         if confidence is None:
             continue
 
-        kelly          = kelly_fraction(model_prob, odds)
-        top_feats      = predictions.get("top_features", {}).get(
-            market.replace("_si", "").replace("_no", ""), []
+        kelly       = kelly_fraction(model_prob, odds)
+        market_type = market.split("_")[0] if "_" in market else market
+        feats       = top_features.get(market_type, [])
+        explanation = build_explanation(
+            market, fixture_row.to_dict(), market_probs, feats
         )
-        explanation    = build_explanation(market, fixture_row.to_dict(), top_feats)
-        edge_vs_market = _compute_edge_vs_market(model_prob, fixture_row, market)
-
-        display_map = {
-            "home_win":  f"Victoria {home}",
-            "draw":      "Empate",
-            "away_win":  f"Victoria {away}",
-            "btts_si":   "Ambos marcan — SÍ",
-            "btts_no":   "Ambos marcan — NO",
-            "over25":    "Over 2.5 goles",
-            "under25":   "Under 2.5 goles",
-            "double_1x": f"DC {home}/Empate",
-            "double_x2": f"DC Empate/{away}",
-            "double_12": f"DC {home}/{away}",
-        }
+        display = MARKET_DISPLAY.get(market, lambda h, a: market)(home, away)
 
         bets.append({
-            "home_team":       home,
-            "away_team":       away,
-            "league":          fixture_row.get("league_name", ""),
-            "match_date":      fixture_row.get("match_date", str(date.today())),
-            "market":          market,
-            "market_display":  display_map.get(market, market),
-            "model_prob":      round(model_prob, 4),
-            "model_prob_pct":  f"{model_prob*100:.1f}%",
-            "reference_odds":  odds,
-            "odds_source":     odds_method,
-            "odds_are_real":   odds_are_real,
-            "edge_pct":        edge,
-            "edge_vs_market":  edge_vs_market,
-            "kelly_pct":       kelly,
-            "confidence":      confidence,
-            "explanation":     explanation,
-            "exp_home_goals":  round(predictions.get("dc_exp_home_goals", 0), 2),
-            "exp_away_goals":  round(predictions.get("dc_exp_away_goals", 0), 2),
-            "n_home_matches":  n_home,
-            "n_away_matches":  n_away,
+            "home_team":        home,
+            "away_team":        away,
+            "league":           fixture_row.get("league_name", ""),
+            "match_date":       fixture_row.get("match_date", str(date.today())),
+            "market":           market,
+            "market_display":   display,
+            "model_prob":       round(model_prob, 4),
+            "model_prob_pct":   f"{model_prob*100:.1f}%",
+            "reference_odds":   round(odds, 3),
+            "odds_source":      odds_method,
+            "odds_are_real":    odds_are_real,
+            "edge_pct":         edge,
+            "kelly_pct":        kelly,
+            "confidence":       confidence,
+            "explanation":      explanation,
+            "exp_home_goals":   round(mu,       2),
+            "exp_away_goals":   round(lam,      2),
+            "exp_total_goals":  round(mu + lam, 2),
+            "n_home_matches":   n_home,
+            "n_away_matches":   n_away,
         })
 
     bets.sort(key=lambda x: (
@@ -530,17 +767,16 @@ def detect_all_value_bets(features_df: pd.DataFrame,
                            all_predictions: list,
                            historical: pd.DataFrame = None) -> pd.DataFrame:
     all_bets = []
-
     for i, (_, fixture) in enumerate(features_df.iterrows()):
         if i >= len(all_predictions):
             break
         preds = all_predictions[i]
         bets  = analyze_fixture(fixture, preds, historical)
         all_bets.extend(bets)
-
         home, away = fixture["home_team"], fixture["away_team"]
         if bets:
-            log.info(f"{home} vs {away}: {len(bets)} value bet(s)")
+            log.info(f"{home} vs {away}: {len(bets)} bet(s) — "
+                     f"{[b['market_display'] for b in bets]}")
         else:
             log.info(f"{home} vs {away}: sin valor")
 
@@ -565,10 +801,11 @@ def summarize_bets(bets_df: pd.DataFrame) -> dict:
         "edge_avg": round(bets_df["edge_pct"].mean(), 2),
     }
     if "odds_source" in bets_df.columns:
-        for method in ["espn_live", "exact_match", "contextual_avg", "fallback"]:
+        for method in ["espn_live", "exact_match", "contextual_avg",
+                       "model_implied", "fd_historical"]:
             count = len(bets_df[bets_df["odds_source"] == method])
             if count:
                 result[f"odds_{method}"] = count
-        real_count = len(bets_df[bets_df.get("odds_are_real", False) == True])  # noqa
-        result["real_odds_pct"] = round(real_count / len(bets_df) * 100, 1)
+    if "market" in bets_df.columns:
+        result["top_mercados"] = bets_df["market"].value_counts().head(5).to_dict()
     return result
