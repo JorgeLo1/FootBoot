@@ -11,6 +11,7 @@ TELEGRAM_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID", "TU_CHAT_ID_AQUI")
 SUPABASE_URL          = os.getenv("SUPABASE_URL",     "TU_SUPABASE_URL_AQUI")
 SUPABASE_KEY          = os.getenv("SUPABASE_KEY",     "TU_SUPABASE_ANON_KEY_AQUI")
 API_FOOTBALL_KEY      = os.getenv("API_FOOTBALL_KEY", "")
+ESPN_ONLY = os.getenv("ESPN_ONLY", "false").lower() == "true"
 
 # ─── TEMPORADA DINÁMICA ───────────────────────────────────────────────────────
 def current_season() -> int:

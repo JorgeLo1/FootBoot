@@ -1,6 +1,13 @@
 """
-espn_collector.py — v2
+espn_collector.py — v3
 Fuente unificada ESPN para FOOTBOT. Sin API key. Sin límite oficial.
+
+FIXES v3:
+  A1 — _parse_score usa displayValue como fuente primaria (value tiene coma decimal)
+  A2 — get_match_odds itera providers hasta encontrar datos válidos (Bet365 null)
+  A3 — to_decimal normaliza coma decimal antes de float() (DraftKings col.1)
+  B1/B2 — _safe_int en get_standings para valores con coma decimal
+  D1/D2 — get_team_schedule acepta parámetro seasons (10x más datos históricos)
 
 Base URLs:
   Site API v2 : https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/
@@ -145,26 +152,52 @@ def _norm_status(raw: str) -> str:
 
 def _parse_score(score) -> int | None:
     """
-    Normaliza el campo score de ESPN que varía según el endpoint:
-      - /scoreboard   → "3"          (string plano)
-      - /schedule     → {"value": 3.0, "displayValue": "3", ...} (dict)
-      - partido futuro → None
+    FIX A1: usa displayValue como fuente primaria.
 
-    FIX: el endpoint /teams/{id}/schedule siempre devuelve score como dict
-    con campos $ref, value, displayValue, winner, source. El scoreboard
-    devuelve un string plano. Esta función maneja ambos casos.
+    ESPN devuelve score de dos formas según el endpoint:
+      - /scoreboard   → string plano "3"
+      - /schedule     → dict {"value": 3,0, "displayValue": "3", ...}
+
+    El campo value tiene coma decimal en entornos ES/COL (3,0 en vez de 3.0),
+    lo que hace que float() falle silenciosamente. displayValue siempre es
+    un string limpio sin coma ("3", "0") — es la fuente correcta.
     """
     if score is None:
         return None
+    # Caso dict: endpoint /schedule
     if isinstance(score, dict):
+        # displayValue primero — siempre string limpio
+        dv = score.get("displayValue")
+        if dv is not None:
+            try:
+                return int(dv)
+            except (ValueError, TypeError):
+                pass
+        # Fallback a value normalizando coma decimal
         val = score.get("value")
         if val is None:
             return None
-        return int(float(val))
+        try:
+            return int(float(str(val).replace(",", ".")))
+        except (ValueError, TypeError):
+            return None
+    # Caso string plano: endpoint /scoreboard
     try:
-        return int(float(str(score)))
+        return int(float(str(score).replace(",", ".")))
     except (ValueError, TypeError):
         return None
+
+
+def _safe_int(val, default: int = 0) -> int:
+    """
+    FIX B1: convierte valores con coma decimal a int sin explotar.
+    ESPN standings devuelve stats como 27,0 (Decimal con coma en ES/COL).
+    int("27,0") explota — este helper lo resuelve.
+    """
+    try:
+        return int(float(str(val).replace(",", ".")))
+    except (TypeError, ValueError):
+        return default
 
 
 def _parse_fixture(event: dict, league_id: int, league_name: str) -> dict | None:
@@ -294,20 +327,44 @@ def get_fixtures_hoy(client=None, target_date: str = None) -> list[dict]:
 
 # ─── CUOTAS EN TIEMPO REAL (Core API /odds) ───────────────────────────────────
 
+def to_decimal(val) -> float | None:
+    """
+    FIX A2/A3: convierte moneyline americano a cuota decimal.
+
+    Maneja:
+      - None → None
+      - Coma decimal (270,0 → 270.0) — DraftKings col.1 / entornos ES
+      - Int32, Decimal, float, str — tipos mixtos según provider
+      - Moneyline americano (+200 → 3.00, -150 → 1.67)
+      - Ya en formato decimal (> 1.0 y < 100) → devuelve tal cual
+    """
+    if val is None:
+        return None
+    try:
+        # Normalizar coma decimal antes de float()
+        v = float(str(val).replace(",", "."))
+        if v >= 100:     return round(v / 100 + 1, 3)   # +200 → 3.00
+        elif v <= -100:  return round(-100 / v + 1, 3)  # -150 → 1.67
+        elif v > 1:      return round(v, 3)              # ya decimal
+        return None
+    except (TypeError, ValueError):
+        return None
+
+
 def get_match_odds(client: ESPNClient, slug: str,
                    event_id: str) -> dict | None:
     """
-    Cuotas reales del partido desde el Core API.
+    FIX A2: itera providers hasta encontrar uno con datos válidos.
+
+    Bet365 (priority=0) tiene moneyLines en null → se salta.
+    DraftKings (priority=1) tiene valores pero con tipos mixtos → to_decimal los maneja.
+    El código anterior tomaba solo el primer provider (sorted[0]) y retornaba None
+    cuando ese provider (Bet365) no tenía datos. Ahora itera hasta encontrar uno útil.
+
     Endpoint: /events/{id}/competitions/{id}/odds
-
-    Retorna dict {home, draw, away, provider, source} en formato decimal,
-    o None si no hay cuotas disponibles para este partido/liga.
-
-    Nota: ESPN suele tener cuotas para ligas grandes (PL, LaLiga, UCL).
-    Para Col.1 y ligas menores puede devolver lista vacía.
     """
     url  = f"{ESPN_CORE_V2}/{slug}/events/{event_id}/competitions/{event_id}/odds"
-    data = client.get(url)
+    data = client.get(url, params={"limit": 5})
     if not data:
         return None
 
@@ -315,55 +372,49 @@ def get_match_odds(client: ESPNClient, slug: str,
     if not items:
         return None
 
-    # Ordenar por prioridad del proveedor (menor número = mayor prioridad)
-    def _priority(item):
-        return item.get("provider", {}).get("priority", 999)
+    # Ordenar por prioridad ascendente (0 = más oficial)
+    items_sorted = sorted(
+        items,
+        key=lambda x: x.get("provider", {}).get("priority", 999)
+    )
 
-    best = sorted(items, key=_priority)[0]
+    for item in items_sorted:
+        try:
+            home_odds = item.get("homeTeamOdds") or {}
+            away_odds = item.get("awayTeamOdds") or {}
+            draw_odds = item.get("drawOdds")     or {}
 
-    try:
-        home_odds = best.get("homeTeamOdds", {})
-        away_odds = best.get("awayTeamOdds", {})
-        draw_odds = best.get("drawOdds", {})
+            h_raw = home_odds.get("moneyLine")
+            a_raw = away_odds.get("moneyLine")
+            d_raw = draw_odds.get("moneyLine")
 
-        def to_decimal(val) -> float | None:
-            """Convierte moneyline americano a cuota decimal."""
-            if val is None:
-                return None
-            try:
-                v = float(val)
-                if v >= 100:     return round(v / 100 + 1, 3)   # +200 → 3.00
-                elif v <= -100:  return round(-100 / v + 1, 3)  # -150 → 1.67
-                elif v > 1:      return round(v, 3)              # ya decimal
-                return None
-            except (TypeError, ValueError):
-                return None
+            # Saltar provider sin datos (e.g. Bet365 con null)
+            if h_raw is None or a_raw is None:
+                provider_name = item.get("provider", {}).get("name", "?")
+                log.debug(f"Provider {provider_name} sin moneyLine — probando siguiente")
+                continue
 
-        # ESPN puede dar moneyLine, odds o value según el proveedor
-        h = to_decimal(
-            home_odds.get("moneyLine") or home_odds.get("odds") or home_odds.get("value")
-        )
-        a = to_decimal(
-            away_odds.get("moneyLine") or away_odds.get("odds") or away_odds.get("value")
-        )
-        d = to_decimal(
-            draw_odds.get("moneyLine") or draw_odds.get("odds") or draw_odds.get("value")
-        )
+            h = to_decimal(h_raw)
+            a = to_decimal(a_raw)
+            d = to_decimal(d_raw)
 
-        if not h or not a:
-            return None
+            if not h or not a:
+                continue
 
-        return {
-            "home":     h,
-            "draw":     d or 3.40,
-            "away":     a,
-            "provider": best.get("provider", {}).get("name", "ESPN"),
-            "source":   "espn_odds",
-        }
+            return {
+                "home":     h,
+                "draw":     d or 3.40,
+                "away":     a,
+                "provider": item.get("provider", {}).get("name", "ESPN"),
+                "source":   "espn_odds",
+            }
 
-    except (TypeError, ValueError, KeyError) as e:
-        log.debug(f"Error parseando odds {event_id}: {e}")
-        return None
+        except (TypeError, ValueError, KeyError) as e:
+            log.debug(f"Error parseando odds item {event_id}: {e}")
+            continue
+
+    log.debug(f"Ningún provider con odds válidas para event {event_id}")
+    return None
 
 
 def enrich_fixtures_with_odds(client: ESPNClient,
@@ -432,8 +483,8 @@ def get_win_probability(client: ESPNClient, slug: str,
 
     latest = items[-1]
     try:
-        h = float(latest.get("homeWinPercentage", 0))
-        a = float(latest.get("awayWinPercentage", 0))
+        h = float(str(latest.get("homeWinPercentage", 0)).replace(",", "."))
+        a = float(str(latest.get("awayWinPercentage", 0)).replace(",", "."))
         d = round(max(0.0, 1.0 - h - a), 4)
         return {
             "home_prob": round(h, 4),
@@ -486,8 +537,6 @@ def estimate_xg_from_plays(plays: list[dict],
         Gol              → 1.00 xG (ocurrió)
         Remate al arco   → 0.15 xG (promedio histórico)
         Remate fuera     → 0.05 xG
-
-    Los type_text de ESPN varían por liga — el matching es por keywords.
     """
     home_xg = 0.0
     away_xg = 0.0
@@ -551,50 +600,76 @@ def get_team_ids(client: ESPNClient, slug: str) -> dict[str, str]:
 
 
 def get_team_schedule(client: ESPNClient, slug: str,
-                      team_id: str, team_name: str) -> list[dict]:
+                      team_id: str, team_name: str,
+                      seasons: list[int] = None) -> list[dict]:
     """
-    Histórico de partidos de un equipo (pasados y futuros).
-    Endpoint: /teams/{id}/schedule (Site API v2)
+    FIX D1/D2: acepta parámetro seasons para obtener histórico multi-temporada.
+
+    Sin seasons: solo obtiene la temporada actual (~13 partidos).
+    Con seasons=[2023, 2024, 2025]: obtiene ~137 partidos — 10x más datos.
+
+    Por defecto usa las últimas 3 temporadas para balance calidad/velocidad.
 
     NOTA: este endpoint devuelve score como dict
-    {"$ref": ..., "value": 3.0, "displayValue": "3"}.
-    Usar _parse_score() para normalizar.
+    {"$ref": ..., "value": 3,0, "displayValue": "3"}.
+    _parse_score() con FIX A1 maneja esto correctamente.
     """
-    url  = f"{ESPN_SITE_V2}/{slug}/teams/{team_id}/schedule"
-    data = client.get(url)
-    if not data:
-        return []
+    if seasons is None:
+        yr = date.today().year
+        # Últimas 3 temporadas por defecto
+        seasons = [yr - 2, yr - 1, yr]
 
-    events = []
-    for event in data.get("events", []):
-        try:
-            comp        = event.get("competitions", [{}])[0]
-            competitors = comp.get("competitors", [])
-            home = next((c for c in competitors if c["homeAway"] == "home"), None)
-            away = next((c for c in competitors if c["homeAway"] == "away"), None)
-            if not home or not away:
-                continue
+    all_events: list[dict] = []
+    seen_ids:   set[str]   = set()
 
-            raw_status = comp.get("status", {}).get("type", {}).get("name", "")
-            status     = _norm_status(raw_status)
-
-            events.append({
-                "match_id":     str(event["id"]),
-                "date":         event.get("date", ""),
-                "slug":         slug,
-                "home_team":    home["team"]["displayName"],
-                "home_team_id": str(home["team"]["id"]),
-                "away_team":    away["team"]["displayName"],
-                "away_team_id": str(away["team"]["id"]),
-                "home_score":   _parse_score(home.get("score")),
-                "away_score":   _parse_score(away.get("score")),
-                "status":       status,
-            })
-        except (KeyError, TypeError):
+    for season in seasons:
+        url  = f"{ESPN_SITE_V2}/{slug}/teams/{team_id}/schedule"
+        data = client.get(url, params={"season": season})
+        if not data:
+            log.debug(f"{team_name} season {season}: sin datos")
             continue
 
-    log.debug(f"{team_name}: {len(events)} partidos en schedule")
-    return events
+        season_events = 0
+        for event in data.get("events", []):
+            try:
+                eid = str(event.get("id", ""))
+                if eid in seen_ids:
+                    continue
+                seen_ids.add(eid)
+
+                comp        = event.get("competitions", [{}])[0]
+                competitors = comp.get("competitors", [])
+                home = next((c for c in competitors if c["homeAway"] == "home"), None)
+                away = next((c for c in competitors if c["homeAway"] == "away"), None)
+                if not home or not away:
+                    continue
+
+                raw_status = comp.get("status", {}).get("type", {}).get("name", "")
+                status     = _norm_status(raw_status)
+
+                all_events.append({
+                    "match_id":     eid,
+                    "date":         event.get("date", ""),
+                    "slug":         slug,
+                    "season":       season,
+                    "home_team":    home["team"]["displayName"],
+                    "home_team_id": str(home["team"]["id"]),
+                    "away_team":    away["team"]["displayName"],
+                    "away_team_id": str(away["team"]["id"]),
+                    # FIX A1: _parse_score usa displayValue como primario
+                    "home_score":   _parse_score(home.get("score")),
+                    "away_score":   _parse_score(away.get("score")),
+                    "status":       status,
+                })
+                season_events += 1
+            except (KeyError, TypeError):
+                continue
+
+        log.debug(f"{team_name} season {season}: {season_events} partidos")
+        time.sleep(0.3)
+
+    log.debug(f"{team_name}: {len(all_events)} partidos totales ({len(seasons)} temporadas)")
+    return all_events
 
 
 # ─── HISTÓRICO POR LIGA ───────────────────────────────────────────────────────
@@ -604,19 +679,16 @@ def build_historical_espn(client: ESPNClient,
                            league_id: int,
                            league_name: str,
                            fetch_plays: bool = False,
-                           max_per_team: int = 30) -> pd.DataFrame:
+                           max_per_team: int = None,
+                           seasons: list[int] = None) -> pd.DataFrame:
     """
-    Construye el histórico de una liga ESPN desde cero.
+    FIX D1/D2: usa get_team_schedule con seasons para 10x más datos históricos.
 
-    Flujo:
-      1. /teams          → IDs de todos los equipos
-      2. /teams/{id}/schedule → partidos (se deduplica por match_id)
-      3. Opcional /plays  → xG aproximado (fetch_plays=True, +1 req/partido)
+    max_per_team: ya no es necesario con seasons — se obtiene la temporada
+    completa por definición. Se mantiene para compatibilidad pero se ignora
+    si se pasan seasons.
 
-    Cuotas históricas: ESPN no las tiene → columnas B365H/PSH = None.
-    Las cuotas en tiempo real se obtienen en el día del partido via get_match_odds().
-
-    Guarda el resultado en data/raw/espn_{slug_normalizado}.csv
+    seasons: por defecto las últimas 3 temporadas (configurado en get_team_schedule).
     """
     log.info(f"Construyendo histórico ESPN: {league_name} ({slug})")
 
@@ -625,12 +697,22 @@ def build_historical_espn(client: ESPNClient,
         log.warning(f"Sin equipos para {league_name}")
         return pd.DataFrame()
 
+    # Construir seasons si no se pasan
+    if seasons is None:
+        yr = date.today().year
+        seasons = [yr - 2, yr - 1, yr]
+
+    log.info(f"{league_name}: descargando temporadas {seasons}...")
+
     # Recopilar eventos únicos via schedules de cada equipo
     seen:   set[str]   = set()
     events: list[dict] = []
 
     for team_name, team_id in team_ids.items():
-        for event in get_team_schedule(client, slug, team_id, team_name)[:max_per_team]:
+        team_events = get_team_schedule(
+            client, slug, team_id, team_name, seasons=seasons
+        )
+        for event in team_events:
             if event["match_id"] not in seen:
                 seen.add(event["match_id"])
                 events.append(event)
@@ -638,14 +720,15 @@ def build_historical_espn(client: ESPNClient,
 
     log.info(f"{league_name}: {len(events)} partidos únicos encontrados")
 
-    # Solo finalizados para entrenamiento
-    # home_score/away_score ya vienen como int|None gracias a _parse_score
+    # Solo finalizados — _parse_score con FIX A1 garantiza scores correctos
     finished = [
         e for e in events
         if e["status"] in FINISHED_STATUSES
         and e["home_score"] is not None
         and e["away_score"] is not None
     ]
+
+    log.info(f"{league_name}: {len(finished)} partidos finalizados de {len(events)} totales")
 
     rows = []
     for i, event in enumerate(finished):
@@ -654,6 +737,7 @@ def build_historical_espn(client: ESPNClient,
             "match_date":   pd.to_datetime(event["date"], utc=True, errors="coerce"),
             "league_id":    league_id,
             "league_name":  league_name,
+            "season":       event.get("season"),
             "home_team":    event["home_team"],
             "home_team_id": event["home_team_id"],
             "away_team":    event["away_team"],
@@ -692,7 +776,7 @@ def build_historical_espn(client: ESPNClient,
     # Guardar en data/raw con prefijo espn_
     path = os.path.join(DATA_RAW, f"espn_{slug.replace('.', '_')}.csv")
     df.to_csv(path, index=False)
-    log.info(f"{league_name}: {len(df)} partidos históricos → {path}")
+    log.info(f"{league_name}: {len(df)} partidos históricos ({seasons}) → {path}")
     return df
 
 
@@ -704,6 +788,9 @@ def get_standings(client: ESPNClient = None,
     Posiciones por competición.
     CORRECCIÓN: usa ESPN_SITE_V2B (/apis/v2/) en lugar de /site/v2/
     que devuelve {} vacío para soccer standings.
+
+    FIX B1/B2: _safe_int en todos los campos numéricos para manejar
+    valores con coma decimal (27,0 → 27) sin explotar.
     """
     if client is None:
         client = ESPNClient()
@@ -733,21 +820,38 @@ def get_standings(client: ESPNClient = None,
         for entries in entry_lists:
             for entry in entries:
                 team  = entry.get("team", {})
+                # FIX B1: usar dict para acceso robusto con _safe_int
                 stats = {s["name"]: s.get("value", 0) for s in entry.get("stats", [])}
+
+                # Bonus B2: parsear "overall" W-D-L si disponible (más robusto)
+                overall_str = next(
+                    (s.get("displayValue", "") for s in entry.get("stats", [])
+                     if s.get("name") == "overall"),
+                    ""
+                )
+                wins_parsed = draws_parsed = losses_parsed = None
+                if "-" in overall_str:
+                    parts = overall_str.split("-")
+                    if len(parts) == 3:
+                        wins_parsed   = _safe_int(parts[0])
+                        draws_parsed  = _safe_int(parts[1])
+                        losses_parsed = _safe_int(parts[2])
+
                 rows.append({
                     "league_id":     league_id,
                     "league_name":   league_name,
-                    "rank":          int(stats.get("rank", 0)),
+                    # FIX B1: _safe_int en todos los campos numéricos
+                    "rank":          _safe_int(stats.get("rank",            0)),
                     "team":          team.get("displayName", ""),
                     "team_id":       str(team.get("id", "")),
-                    "points":        int(stats.get("points", 0)),
-                    "played":        int(stats.get("gamesPlayed", 0)),
-                    "won":           int(stats.get("wins", 0)),
-                    "drawn":         int(stats.get("ties", 0)),
-                    "lost":          int(stats.get("losses", 0)),
-                    "goals_for":     int(stats.get("pointsFor", 0)),
-                    "goals_against": int(stats.get("pointsAgainst", 0)),
-                    "goal_diff":     int(stats.get("pointDifferential", 0)),
+                    "points":        _safe_int(stats.get("points",          0)),
+                    "played":        _safe_int(stats.get("gamesPlayed",     0)),
+                    "won":           wins_parsed   if wins_parsed   is not None else _safe_int(stats.get("wins",   0)),
+                    "drawn":         draws_parsed  if draws_parsed  is not None else _safe_int(stats.get("ties",   0)),
+                    "lost":          losses_parsed if losses_parsed is not None else _safe_int(stats.get("losses", 0)),
+                    "goals_for":     _safe_int(stats.get("pointsFor",       0)),
+                    "goals_against": _safe_int(stats.get("pointsAgainst",   0)),
+                    "goal_diff":     _safe_int(stats.get("pointDifferential",0)),
                     "form":          str(stats.get("streak", "")),
                     "group":         data.get("name", ""),
                     "updated_at":    str(date.today()),
@@ -1013,12 +1117,13 @@ if __name__ == "__main__":
         print(f"  {row['rank']:2d}. {row['team']:25s} {row['points']} pts "
               f"({row['played']} PJ)")
 
-    print("\n=== HISTÓRICO Col.1 (max 5 partidos/equipo) ===")
+    print("\n=== HISTÓRICO Col.1 (últimas 3 temporadas) ===")
     hist = build_historical_espn(
         client, "col.1", 501, "Liga BetPlay",
-        fetch_plays=False, max_per_team=5,
+        fetch_plays=False,
+        seasons=[date.today().year - 2, date.today().year - 1, date.today().year],
     )
     print(f"  {len(hist)} partidos descargados")
     if not hist.empty:
-        print(hist[["match_date", "home_team", "home_goals",
+        print(hist[["match_date", "season", "home_team", "home_goals",
                      "away_goals", "away_team"]].tail(5).to_string(index=False))

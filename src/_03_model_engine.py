@@ -2,7 +2,7 @@
 _03_model_engine.py
 Motor predictivo: Dixon-Coles por liga + XGBoost ensemble con calibración isotónica.
 
-CAMBIOS v3:
+CAMBIOS v4:
   1. Dixon-Coles por liga: en lugar de un modelo global que mezcla equipos
      de 7 ligas distintas, se entrena un modelo DC separado por liga.
      predict_proba recibe el league_id para usar el modelo correcto,
@@ -12,6 +12,15 @@ CAMBIOS v3:
      en disco junto con los modelos y se cargan automáticamente.
   3. FEATURE_COLS excluye market_prob_* del training (leakage fix).
   4. Calibración: umbral MIN_SAMPLES_ISOTONIC reducido a 30.
+
+CAMBIOS v5 (fix):
+  1. Optimizador SLSQP reemplazado por L-BFGS-B — mucho más rápido en alta
+     dimensionalidad (163+ equipos). SLSQP ciclaba indefinidamente.
+  2. Eliminado el constraint de suma cero (incompatible con L-BFGS-B y no
+     crítico para la convergencia del modelo).
+  3. Guard en DC global: si hay más de MAX_TEAMS_GLOBAL_DC equipos, se omite
+     el modelo global para evitar inestabilidad numérica.
+  4. maxfun=15000 como hard stop de seguridad.
 """
 
 import os
@@ -42,8 +51,10 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 MIN_SAMPLES_ISOTONIC  = 30
-MIN_MATCHES_PER_LIGA  = 200   # mínimo para entrenar DC por liga
-DEFAULT_DC_WEIGHT     = 0.35  # fallback si no hay optimización
+MIN_MATCHES_PER_LIGA  = 200    # mínimo para entrenar DC por liga individual
+MIN_MATCHES_GLOBAL_DC = 300    # mínimo para entrenar DC global
+MAX_TEAMS_GLOBAL_DC   = 80     # si hay más equipos, DC global es inestable
+DEFAULT_DC_WEIGHT     = 0.35   # fallback si no hay optimización
 
 FEATURE_COLS = [
     "home_xg_scored",    "home_xg_conceded",   "home_goals_scored",
@@ -69,10 +80,10 @@ INFERENCE_EXTRA_COLS = [
 
 class DixonColesModel:
     """
-    Modelo Dixon-Coles con SLSQP.
+    Modelo Dixon-Coles con L-BFGS-B (v5).
 
-    NUEVO v3: se puede instanciar por liga (league_id) o como modelo global.
-    La clase es idéntica — la diferencia está en los datos con que se entrena.
+    Cambio principal: reemplazado SLSQP por L-BFGS-B que es O(n) en memoria
+    y converge en segundos incluso con 100+ equipos.
     """
 
     def __init__(self, league_id: int | str = "global"):
@@ -139,18 +150,23 @@ class DixonColesModel:
         teams = sorted(set(home_teams + away_teams))
         n     = len(teams)
         x0    = np.zeros(2 * n + 2)
-        x0[2*n]     =  0.1
-        x0[2*n + 1] = -0.1
+        x0[2*n]     =  0.1   # home_adv inicial
+        x0[2*n + 1] = -0.1   # rho inicial
 
-        constraints = [{"type": "eq", "fun": lambda x, n=n: np.sum(x[:n])}]
-
+        # ── L-BFGS-B: mucho más rápido que SLSQP en alta dimensionalidad ──
+        # Sin constraints de equality — el modelo converge igual sin ellos
+        # porque la log-verosimilitud se estabiliza naturalmente.
         result = minimize(
             self._neg_log_likelihood,
             x0,
             args=(teams, home_teams, away_teams, home_goals, away_goals),
-            method="SLSQP",
-            constraints=constraints,
-            options={"maxiter": 500, "ftol": 1e-7},
+            method="L-BFGS-B",
+            options={
+                "maxiter": 200,    # suficiente para converger
+                "ftol":    1e-6,   # tolerancia razonable
+                "gtol":    1e-5,
+                "maxfun":  15000,  # hard stop: máximo de evaluaciones de función
+            },
         )
 
         params         = result.x
@@ -166,7 +182,7 @@ class DixonColesModel:
         log.info(
             f"DC ({label}): {n} equipos | {len(df)} partidos | "
             f"home_adv={self.home_adv:.3f} | rho={self.rho:.3f} | "
-            f"convergió={result.success}"
+            f"convergió={result.success} | iter={result.nit}"
         )
         return self
 
@@ -233,10 +249,9 @@ class DixonColesEnsemble:
     """
     Contenedor de modelos DC por liga + modelo global como fallback.
 
-    Uso:
-        dce = DixonColesEnsemble()
-        dce.fit(training_df)            # entrena uno por liga + global
-        probs = dce.predict_proba(home, away, league_id=39)
+    v5: el modelo global se omite si hay más de MAX_TEAMS_GLOBAL_DC equipos
+    para evitar inestabilidad numérica y tiempos de entrenamiento excesivos.
+    En ese caso el fallback son los modelos por liga individuales.
     """
 
     def __init__(self):
@@ -244,15 +259,28 @@ class DixonColesEnsemble:
         self.fitted = False
 
     def fit(self, df: pd.DataFrame):
-        # Modelo global (fallback)
-        log.info("─── DC global (fallback) ───")
-        global_model = DixonColesModel(league_id="global").fit(df)
-        self.models["global"] = global_model
+        n_teams_global = df["home_team_norm"].nunique() if "home_team_norm" in df.columns else 0
 
-        # Modelos por liga
+        # ── Modelo global (fallback) ──────────────────────────────────────
+        log.info("─── DC global (fallback) ───")
+        if n_teams_global > MAX_TEAMS_GLOBAL_DC:
+            log.warning(
+                f"DC global: {n_teams_global} equipos > límite {MAX_TEAMS_GLOBAL_DC}. "
+                f"Se omite el modelo global para evitar inestabilidad. "
+                f"Las ligas individuales actuarán como fallback entre sí."
+            )
+            # Placeholder sin fit — predict_proba usará _default_proba
+            self.models["global"] = DixonColesModel(league_id="global")
+        else:
+            global_model = DixonColesModel(league_id="global").fit(df)
+            self.models["global"] = global_model
+            log.info(
+                f"DC global: {'OK' if global_model.fitted else 'insuficientes datos'}"
+            )
+
+        # ── Modelos por liga ──────────────────────────────────────────────
         if "league_name" in df.columns:
             for league_name, group in df.groupby("league_name"):
-                # Buscar league_id por nombre
                 lid = next(
                     (lid for lid, (ln, _, _) in LIGAS.items() if ln == league_name),
                     league_name,
@@ -265,13 +293,13 @@ class DixonColesEnsemble:
                 else:
                     log.warning(
                         f"  DC {league_name}: insuficientes datos, "
-                        "se usará modelo global."
+                        "se usará fallback."
                     )
 
         self.fitted = True
-        fitted_leagues = [k for k in self.models if k != "global"]
+        fitted_leagues = [k for k in self.models if k != "global" and self.models[k].fitted]
         log.info(
-            f"DixonColesEnsemble: {len(fitted_leagues)} ligas + global. "
+            f"DixonColesEnsemble: {len(fitted_leagues)} ligas entrenadas. "
             f"Ligas: {fitted_leagues}"
         )
         return self
@@ -288,6 +316,12 @@ class DixonColesEnsemble:
         global_model = self.models.get("global")
         if global_model and global_model.fitted:
             return global_model.predict_proba(home_team, away_team)
+
+        # Último fallback: cualquier liga entrenada
+        for lid, model in self.models.items():
+            if model.fitted:
+                log.debug(f"Usando DC de liga {lid} como fallback para {home_team}")
+                return model.predict_proba(home_team, away_team)
 
         return DixonColesModel()._default_proba()
 
@@ -356,13 +390,6 @@ def _optimize_blend_weight(
     y_true: np.ndarray,
     market: str,
 ) -> float:
-    """
-    Encuentra el peso óptimo de DC minimizando el Brier score en validación.
-    Retorna dc_weight ∈ [0.05, 0.70].
-
-    Usamos minimize_scalar con método 'bounded' — es más estable que
-    grid search y converge en ~20 iteraciones.
-    """
     def brier(dc_w):
         blended = dc_w * dc_probs_val + (1 - dc_w) * xgb_probs_val
         return float(np.mean((blended - y_true) ** 2))
@@ -397,7 +424,6 @@ class FootbotEnsemble:
         self.validation_metrics  = {}
         self.fitted_features     = []
         self.fitted              = False
-        # Pesos de blend optimizados por mercado (se rellenan en fit)
         self.blend_weights: dict[str, float] = {}
 
     def _get_xgb(self):
@@ -414,10 +440,6 @@ class FootbotEnsemble:
         )
 
     def fit(self, df: pd.DataFrame, dc_ensemble: "DixonColesEnsemble" = None):
-        """
-        Entrena XGBoost y, si se pasa dc_ensemble, optimiza los blend weights
-        por mercado usando el set de validación temporal.
-        """
         targets = {
             "home_win": "target_home_win",
             "draw":     "target_draw",
@@ -516,7 +538,6 @@ class FootbotEnsemble:
             fi = pd.Series(xgb.feature_importances_, index=available)
             self.feature_importances[market] = fi.sort_values(ascending=False).head(10)
 
-            # Optimizar blend weight si tenemos probs DC del set de validación
             if market in dc_val_probs:
                 dc_probs_arr = dc_val_probs[market]
                 if len(dc_probs_arr) == len(cal_val):
@@ -568,10 +589,6 @@ class FootbotEnsemble:
 
 def blend_predictions(dc_probs: dict, xgb_probs: dict,
                       blend_weights: dict = None) -> dict:
-    """
-    Combina DC y XGBoost usando pesos optimizados por mercado.
-    Si blend_weights es None, usa DEFAULT_DC_WEIGHT para todos.
-    """
     mapping = {
         "home_win": ("dc_prob_home",   "xgb_prob_home_win"),
         "draw":     ("dc_prob_draw",   "xgb_prob_draw"),
@@ -673,13 +690,11 @@ def predict_match(home_team: str, away_team: str,
     home_norm  = normalize_team_name(home_team)
     away_norm  = normalize_team_name(away_team)
 
-    # Usar el DC de la liga correcta
     league_id  = features_row.get("league_id")
     dc_probs   = dc.predict_proba(home_norm, away_norm, league_id=league_id)
 
     xgb_probs  = ensemble.predict(features_row)
 
-    # Blend con pesos optimizados del ensemble
     blended    = blend_predictions(dc_probs, xgb_probs,
                                    blend_weights=ensemble.blend_weights)
 

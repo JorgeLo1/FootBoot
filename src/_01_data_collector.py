@@ -2,6 +2,13 @@
 _01_data_collector.py
 Descarga y normaliza todas las fuentes de datos.
 
+FIXES v3:
+  - download_football_data: retry con backoff exponencial para WinError 10054
+    (servidor Football-Data.co.uk cerrando conexiones). Usa Session con
+    headers apropiados y pausa entre ligas para evitar bloqueo.
+  - _get_fixtures_fdorg: mismo retry para fixtures del día.
+  - get_weather_for_fixture: delegado a utils.py (coordenadas LATAM).
+
 Fuentes:
   - Fixtures del día        : football-data.org (free, 10 req/min) +
                               ESPN API (sin key, backup/ampliación)
@@ -21,8 +28,9 @@ import numpy as np
 import pandas as pd
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import warnings
-
 
 warnings.filterwarnings("ignore", category=UserWarning, module="statsbombpy")
 
@@ -42,6 +50,48 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 log = logging.getLogger(__name__)
+
+
+# ─── SESSION CON RETRY ───────────────────────────────────────────────────────
+
+def _make_session(retries: int = 4, backoff: float = 1.5) -> requests.Session:
+    """
+    Session con retry automático y backoff exponencial.
+
+    Motivo: Football-Data.co.uk cierra conexiones activamente (WinError 10054)
+    cuando recibe requests muy seguidas o con user-agent genérico.
+    Con retry + backoff + headers realistas esto se resuelve en la mayoría
+    de los casos sin intervención manual.
+
+    retries=4, backoff=1.5 → esperas de 1.5, 3, 6, 12 segundos.
+    """
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-GB,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "Connection":      "keep-alive",
+    })
+    retry_strategy = Retry(
+        total=retries,
+        backoff_factor=backoff,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://",  adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+# Sesión reutilizable para Football-Data.co.uk
+_FD_SESSION = _make_session()
 
 
 # ─── FIXTURES DEL DÍA ────────────────────────────────────────────────────────
@@ -64,7 +114,6 @@ def get_fixtures_today() -> pd.DataFrame:
     # ── Fuente 2: ESPN (ligas adicionales) ────────────────────────────────
     espn_df = _get_fixtures_espn_today()
     if not espn_df.empty:
-        # Excluir ligas que ya cubre football-data.org para no duplicar
         ligas_eu_ids = set(LIGAS.keys())
         espn_df = espn_df[~espn_df["league_id"].isin(ligas_eu_ids)]
         if not espn_df.empty:
@@ -75,8 +124,6 @@ def get_fixtures_today() -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.concat(frames, ignore_index=True)
-
-    # Deduplicar por equipos + fecha por si alguna liga aparece en ambas fuentes
     df = df.drop_duplicates(
         subset=["home_team", "away_team"],
         keep="first"
@@ -90,7 +137,10 @@ def get_fixtures_today() -> pd.DataFrame:
 
 
 def _get_fixtures_fdorg() -> pd.DataFrame:
-    """Fixtures desde football-data.org (7 ligas EU, 10 req/min)."""
+    """
+    Fixtures desde football-data.org (7 ligas EU, 10 req/min).
+    FIX: usa _make_session() con retry para WinError 10054.
+    """
     if not FOOTBALL_DATA_ORG_KEY:
         log.warning(
             "FOOTBALL_DATA_ORG_KEY no configurada. "
@@ -101,35 +151,47 @@ def _get_fixtures_fdorg() -> pd.DataFrame:
     today   = date.today().strftime("%Y-%m-%d")
     headers = {"X-Auth-Token": FOOTBALL_DATA_ORG_KEY}
     rows    = []
+    session = _make_session()
 
     for league_id, (league_name, _, fdorg_id) in LIGAS.items():
-        try:
-            resp = requests.get(
-                f"{FOOTBALL_DATA_ORG_URL}/competitions/{fdorg_id}/matches",
-                headers=headers,
-                params={"dateFrom": today, "dateTo": today},
-                timeout=10,
-            )
-            resp.raise_for_status()
+        for attempt in range(3):
+            try:
+                resp = session.get(
+                    f"{FOOTBALL_DATA_ORG_URL}/competitions/{fdorg_id}/matches",
+                    headers=headers,
+                    params={"dateFrom": today, "dateTo": today},
+                    timeout=15,
+                )
+                resp.raise_for_status()
 
-            for match in resp.json().get("matches", []):
-                if match["status"] not in ("SCHEDULED", "TIMED", "IN_PLAY", "FINISHED"):
-                    continue
-                rows.append({
-                    "fixture_id":  match["id"],
-                    "date":        match["utcDate"],
-                    "league_id":   league_id,
-                    "league_name": league_name,
-                    "home_team":   match["homeTeam"]["name"],
-                    "away_team":   match["awayTeam"]["name"],
-                    "venue":       "",
-                    "venue_city":  "",
-                    "status":      match["status"],
-                    "source":      "fdorg",
-                })
-            log.info(f"✓ Fixtures {league_name}: OK")
-        except Exception as e:
-            log.warning(f"Error fixtures {league_name} (fd.org): {e}")
+                for match in resp.json().get("matches", []):
+                    if match["status"] not in ("SCHEDULED", "TIMED", "IN_PLAY", "FINISHED"):
+                        continue
+                    rows.append({
+                        "fixture_id":  match["id"],
+                        "date":        match["utcDate"],
+                        "league_id":   league_id,
+                        "league_name": league_name,
+                        "home_team":   match["homeTeam"]["name"],
+                        "away_team":   match["awayTeam"]["name"],
+                        "venue":       "",
+                        "venue_city":  "",
+                        "status":      match["status"],
+                        "source":      "fdorg",
+                    })
+                log.info(f"✓ Fixtures {league_name}: OK")
+                break  # éxito — salir del loop de reintentos
+
+            except Exception as e:
+                wait = 2 ** attempt * 3
+                log.warning(
+                    f"Intento {attempt+1}/3 fallido para fixtures {league_name}: {e} "
+                    f"— reintentando en {wait}s"
+                )
+                if attempt < 2:
+                    time.sleep(wait)
+                else:
+                    log.error(f"Fixtures {league_name}: abandonado tras 3 intentos")
 
         time.sleep(6)  # respetar 10 req/min del free tier
 
@@ -141,7 +203,6 @@ def _get_fixtures_espn_today() -> pd.DataFrame:
     try:
         from src.espn_collector import ESPNClient, get_fixtures_today as espn_get_today
         client = ESPNClient(delay=0.5)
-        # Solo ligas activas ESPN
         slugs_activos = {
             k: v for k, v in LIGAS_ESPN.items()
             if k in LIGAS_ESPN_ACTIVAS
@@ -160,6 +221,7 @@ def _get_fixtures_espn_today() -> pd.DataFrame:
 def get_results_fdorg(target_date: str) -> dict:
     """
     Resultados finalizados de football-data.org para una fecha.
+    FIX: usa session con retry para WinError 10054.
     Retorna {(home_team, away_team): {home_goals, away_goals, fixture_id, status}}
     """
     if not FOOTBALL_DATA_ORG_KEY:
@@ -167,31 +229,41 @@ def get_results_fdorg(target_date: str) -> dict:
 
     headers = {"X-Auth-Token": FOOTBALL_DATA_ORG_KEY}
     results = {}
+    session = _make_session()
 
     for league_id, (league_name, _, fdorg_id) in LIGAS.items():
-        try:
-            resp = requests.get(
-                f"{FOOTBALL_DATA_ORG_URL}/competitions/{fdorg_id}/matches",
-                headers=headers,
-                params={"dateFrom": target_date, "dateTo": target_date,
-                        "status": "FINISHED"},
-                timeout=10,
-            )
-            resp.raise_for_status()
+        for attempt in range(3):
+            try:
+                resp = session.get(
+                    f"{FOOTBALL_DATA_ORG_URL}/competitions/{fdorg_id}/matches",
+                    headers=headers,
+                    params={"dateFrom": target_date, "dateTo": target_date,
+                            "status": "FINISHED"},
+                    timeout=15,
+                )
+                resp.raise_for_status()
 
-            for match in resp.json().get("matches", []):
-                score = match.get("score", {})
-                full  = score.get("fullTime", {})
-                hg    = full.get("home") or 0
-                ag    = full.get("away") or 0
-                results[(match["homeTeam"]["name"], match["awayTeam"]["name"])] = {
-                    "home_goals": int(hg),
-                    "away_goals": int(ag),
-                    "fixture_id": match["id"],
-                    "status":     match["status"],
-                }
-        except Exception as e:
-            log.warning(f"Error resultados fd.org {league_name}: {e}")
+                for match in resp.json().get("matches", []):
+                    score = match.get("score", {})
+                    full  = score.get("fullTime", {})
+                    hg    = full.get("home") or 0
+                    ag    = full.get("away") or 0
+                    results[(match["homeTeam"]["name"], match["awayTeam"]["name"])] = {
+                        "home_goals": int(hg),
+                        "away_goals": int(ag),
+                        "fixture_id": match["id"],
+                        "status":     match["status"],
+                    }
+                break  # éxito
+
+            except Exception as e:
+                wait = 2 ** attempt * 3
+                log.warning(
+                    f"Intento {attempt+1}/3 fallido resultados {league_name}: {e} "
+                    f"— reintentando en {wait}s"
+                )
+                if attempt < 2:
+                    time.sleep(wait)
 
         time.sleep(6)
 
@@ -209,23 +281,19 @@ def get_results_today(target_date: str = None) -> dict:
 
     results = {}
 
-    # fd.org para ligas EU
     try:
         results.update(get_results_fdorg(target_date))
     except Exception as e:
         log.warning(f"fd.org resultados falló: {e}")
 
-    # ESPN para ligas adicionales
     try:
         from src.espn_collector import get_results_espn, TODOS_LOS_SLUGS, LIGAS_ESPN
-        # Solo slugs ESPN activos que no estén en LIGAS (para no duplicar)
         ligas_eu_ids = set(LIGAS.keys())
         slugs_extra  = {
             k: v for k, v in LIGAS_ESPN.items()
             if v[0] not in ligas_eu_ids
         }
         espn_results = get_results_espn(target_date, slugs=slugs_extra)
-        # ESPN no sobreescribe fd.org (fd.org tiene prioridad por tener cuotas)
         for key, val in espn_results.items():
             if key not in results:
                 results[key] = val
@@ -241,21 +309,53 @@ def get_results_today(target_date: str = None) -> dict:
 def download_football_data() -> dict:
     """
     Descarga CSVs de Football-Data.co.uk para las 7 ligas EU.
-    Incluye cuotas reales (B365, Pinnacle) para el value detector.
+
+    FIX: retry con backoff exponencial para WinError 10054.
+    El servidor cierra conexiones cuando recibe requests muy seguidas.
+    Estrategia:
+      - Session con User-Agent de browser real
+      - 3 intentos por CSV con espera 3s, 6s, 12s
+      - Pausa de 2s entre ligas (además del retry)
     """
     dfs = {}
+
     for league_id, (league_name, fd_code, _) in LIGAS.items():
         frames = []
+
         for season in FOOTBALL_DATA_SEASONS:
             url = f"{FOOTBALL_DATA_URL}/{season}/{fd_code}.csv"
-            try:
-                df = pd.read_csv(url, encoding="latin-1", on_bad_lines="skip")
-                df["season"]      = season
-                df["league_name"] = league_name
-                frames.append(df)
-                log.info(f"✓ {league_name} {season}: {len(df)} partidos")
-            except Exception as e:
-                log.warning(f"No disponible {league_name} {season}: {e}")
+
+            for attempt in range(3):
+                try:
+                    # Usar _FD_SESSION con User-Agent de browser
+                    resp = _FD_SESSION.get(url, timeout=20)
+                    resp.raise_for_status()
+
+                    # Leer CSV desde el contenido en memoria (evita re-request)
+                    import io
+                    df = pd.read_csv(
+                        io.StringIO(resp.content.decode("latin-1")),
+                        on_bad_lines="skip"
+                    )
+                    df["season"]      = season
+                    df["league_name"] = league_name
+                    frames.append(df)
+                    log.info(f"✓ {league_name} {season}: {len(df)} partidos")
+                    break  # éxito
+
+                except Exception as e:
+                    wait = (2 ** attempt) * 3  # 3s, 6s, 12s
+                    if attempt < 2:
+                        log.warning(
+                            f"Intento {attempt+1}/3 fallido {league_name} {season}: {e} "
+                            f"— reintentando en {wait}s"
+                        )
+                        time.sleep(wait)
+                    else:
+                        log.warning(f"No disponible {league_name} {season}: {e}")
+
+            # Pausa corta entre temporadas para no saturar
+            time.sleep(0.5)
 
         if frames:
             combined = pd.concat(frames, ignore_index=True)
@@ -264,19 +364,23 @@ def download_football_data() -> dict:
             dfs[fd_code] = combined
             log.info(f"→ {fd_code}: {len(combined)} partidos totales")
 
+        # Pausa entre ligas
+        time.sleep(2)
+
     return dfs
 
 
 # ─── DATOS HISTÓRICOS ESPN (ligas sin cobertura EU) ──────────────────────────
 
 def download_espn_historical(fetch_plays: bool = False,
-                              max_per_team: int = 30) -> dict:
+                              max_per_team: int = None,
+                              seasons: list[int] = None) -> dict:
     """
     Descarga histórico ESPN para las ligas activas que no cubre fd.co.uk.
     Se llama durante el re-entrenamiento semanal (lunes).
 
-    fetch_plays=True añade xG aproximado pero triplica las llamadas.
-    max_per_team: partidos por equipo a descargar (30 ≈ temporada completa).
+    FIX: pasa seasons a build_historical_espn para datos multi-temporada.
+    max_per_team ya no es necesario — se mantiene por compatibilidad.
     """
     try:
         from src.espn_collector import ESPNClient, build_historical_espn
@@ -287,9 +391,7 @@ def download_espn_historical(fetch_plays: bool = False,
     client = ESPNClient(delay=0.5)
     dfs    = {}
 
-    # Excluir ligas que ya cubre football-data.co.uk
-    ligas_eu_fd_codes = {fd_code for _, (_, fd_code, _) in LIGAS.items()}
-    eu_slugs          = {"eng.1", "esp.1", "ger.1", "ita.1", "fra.1", "ned.1", "por.1"}
+    eu_slugs = {"eng.1", "esp.1", "ger.1", "ita.1", "fra.1", "ned.1", "por.1"}
 
     for slug, (league_id, league_name) in LIGAS_ESPN.items():
         if slug not in LIGAS_ESPN_ACTIVAS:
@@ -302,7 +404,7 @@ def download_espn_historical(fetch_plays: bool = False,
             df = build_historical_espn(
                 client, slug, league_id, league_name,
                 fetch_plays=fetch_plays,
-                max_per_team=max_per_team,
+                seasons=seasons,
             )
             if not df.empty:
                 dfs[slug] = df
@@ -316,9 +418,6 @@ def download_espn_historical(fetch_plays: bool = False,
 def load_espn_historical() -> pd.DataFrame:
     """
     Carga todos los CSVs ESPN guardados en data/raw/espn_*.csv.
-    Los fusiona en un DataFrame con el schema normalizado de FOOTBOT.
-    Llamado por _02_feature_builder.load_historical_results() para enriquecer
-    el conjunto de entrenamiento con ligas no europeas.
     """
     frames = []
     raw_dir = Path(DATA_RAW)
@@ -341,7 +440,6 @@ def load_espn_historical() -> pd.DataFrame:
     combined = pd.concat(frames, ignore_index=True)
     combined["match_date"] = pd.to_datetime(combined["match_date"], errors="coerce")
 
-    # Solo finalizados
     if "status" in combined.columns:
         combined = combined[combined["status"] == "FT"].copy()
 
@@ -490,10 +588,14 @@ def download_statsbomb_data() -> dict:
 
 def download_elo_ratings() -> pd.DataFrame:
     """Descarga ratings ELO de ClubElo.com con fallback a días anteriores."""
+    session = _make_session()
     for days_back in range(0, 4):
         target = (date.today() - timedelta(days=days_back)).strftime("%Y-%m-%d")
         try:
-            df   = pd.read_csv(f"{CLUBELO_URL}/{target}")
+            resp = session.get(f"{CLUBELO_URL}/{target}", timeout=15)
+            resp.raise_for_status()
+            import io
+            df   = pd.read_csv(io.StringIO(resp.text))
             path = os.path.join(DATA_RAW, "elo_ratings.csv")
             df.to_csv(path, index=False)
             log.info(f"ELO ratings: {len(df)} equipos (hace {days_back}d)")
@@ -521,11 +623,11 @@ def run():
     elo      = download_elo_ratings()
     log.info("═══ Recolección completada ═══")
     return {
-        "fixtures":       fixtures,
-        "football_data":  fd_data,
+        "fixtures":        fixtures,
+        "football_data":   fd_data,
         "espn_historical": espn_h,
-        "statsbomb":      sb_data,
-        "elo":            elo,
+        "statsbomb":       sb_data,
+        "elo":             elo,
     }
 
 

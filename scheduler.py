@@ -29,6 +29,7 @@ from config.settings import (
     TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
     FOOTBALL_DATA_ORG_KEY, SUPABASE_URL, SUPABASE_KEY,
     LIGAS_ESPN, LIGAS_ESPN_ACTIVAS,
+    ESPN_ONLY,
 )
 
 os.makedirs(LOGS_DIR, exist_ok=True)
@@ -115,10 +116,11 @@ def run_pipeline():
 
         if retrain:
             log.info("Actualizando datos históricos...")
-            # EU: Football-Data.co.uk (CSV con cuotas)
-            download_football_data()
-            download_statsbomb_data()
-            # Adicionales: ESPN (goles, sin cuotas históricas)
+            if ESPN_ONLY:
+                log.info("ESPN_ONLY=true — saltando Football-Data.co.uk y StatsBomb")
+            else:
+                download_football_data()
+                download_statsbomb_data()
             log.info("Descargando histórico ESPN para ligas adicionales...")
             try:
                 download_espn_historical(fetch_plays=False, max_per_team=30)
