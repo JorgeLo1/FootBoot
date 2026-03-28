@@ -1,0 +1,73 @@
+# ─── ENTORNO VIRTUAL ─────────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+
+# ─── VARIABLES DE ENTORNO ────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ─── DATOS (no versionar CSVs ni JSONs pesados) ───────────────────────────────
+data/raw/
+data/statsbomb/
+data/processed/
+
+# ─── MODELOS ENTRENADOS ───────────────────────────────────────────────────────
+models/
+*.pkl
+*.joblib
+
+# ─── LOGS ────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ─── PYTHON ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+wheels/
+
+# ─── JUPYTER ─────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ─── EDITORES ────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ─── PYTEST / COBERTURA ──────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ─── MYPY ────────────────────────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+
+# ─── ARCHIVOS TEMPORALES ─────────────────────────────────────────────────────
+*.tmp
+*.bak
+*.orig

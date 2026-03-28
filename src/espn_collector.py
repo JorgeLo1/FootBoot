@@ -143,6 +143,30 @@ def _norm_status(raw: str) -> str:
     return _STATUS_MAP.get(raw, raw)
 
 
+def _parse_score(score) -> int | None:
+    """
+    Normaliza el campo score de ESPN que varía según el endpoint:
+      - /scoreboard   → "3"          (string plano)
+      - /schedule     → {"value": 3.0, "displayValue": "3", ...} (dict)
+      - partido futuro → None
+
+    FIX: el endpoint /teams/{id}/schedule siempre devuelve score como dict
+    con campos $ref, value, displayValue, winner, source. El scoreboard
+    devuelve un string plano. Esta función maneja ambos casos.
+    """
+    if score is None:
+        return None
+    if isinstance(score, dict):
+        val = score.get("value")
+        if val is None:
+            return None
+        return int(float(val))
+    try:
+        return int(float(str(score)))
+    except (ValueError, TypeError):
+        return None
+
+
 def _parse_fixture(event: dict, league_id: int, league_name: str) -> dict | None:
     """
     Convierte un evento del scoreboard ESPN al schema interno de FOOTBOT.
@@ -531,6 +555,10 @@ def get_team_schedule(client: ESPNClient, slug: str,
     """
     Histórico de partidos de un equipo (pasados y futuros).
     Endpoint: /teams/{id}/schedule (Site API v2)
+
+    NOTA: este endpoint devuelve score como dict
+    {"$ref": ..., "value": 3.0, "displayValue": "3"}.
+    Usar _parse_score() para normalizar.
     """
     url  = f"{ESPN_SITE_V2}/{slug}/teams/{team_id}/schedule"
     data = client.get(url)
@@ -558,8 +586,8 @@ def get_team_schedule(client: ESPNClient, slug: str,
                 "home_team_id": str(home["team"]["id"]),
                 "away_team":    away["team"]["displayName"],
                 "away_team_id": str(away["team"]["id"]),
-                "home_score":   home.get("score"),
-                "away_score":   away.get("score"),
+                "home_score":   _parse_score(home.get("score")),
+                "away_score":   _parse_score(away.get("score")),
                 "status":       status,
             })
         except (KeyError, TypeError):
@@ -611,6 +639,7 @@ def build_historical_espn(client: ESPNClient,
     log.info(f"{league_name}: {len(events)} partidos únicos encontrados")
 
     # Solo finalizados para entrenamiento
+    # home_score/away_score ya vienen como int|None gracias a _parse_score
     finished = [
         e for e in events
         if e["status"] in FINISHED_STATUSES
