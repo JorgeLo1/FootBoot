@@ -21,6 +21,16 @@ CAMBIOS v5 (fix):
   3. Guard en DC global: si hay más de MAX_TEAMS_GLOBAL_DC equipos, se omite
      el modelo global para evitar inestabilidad numérica.
   4. maxfun=15000 como hard stop de seguridad.
+
+CAMBIOS v6 (fix league_id lookup):
+  1. DixonColesEnsemble.predict_proba: las ligas ESPN se guardan con
+     league_name como clave (no league_id numérico) porque no están en LIGAS
+     (que solo tiene las 7 ligas EU). Se añade un segundo paso de lookup que
+     resuelve league_id numérico → league_name usando LIGAS_ESPN y
+     COMPETICIONES_NACIONALES_ESPN, evitando que col.1, arg.1, etc. caigan
+     siempre al modelo global con probabilidades por defecto.
+  2. FootbotEnsemble.fit: el mismo fix se aplica al pre-cálculo de probs DC
+     en el set de validación para la optimización de blend weights.
 """
 
 import os
@@ -74,6 +84,30 @@ FEATURE_COLS = [
 INFERENCE_EXTRA_COLS = [
     "market_prob_home", "market_prob_draw", "market_prob_away",
 ]
+
+
+# ─── HELPER: resolver league_id numérico → league_name ───────────────────────
+
+def _resolve_league_name(league_id: int | str) -> str | None:
+    """
+    Resuelve un league_id numérico al nombre de liga usado como clave
+    en DixonColesEnsemble.models para ligas ESPN/LATAM.
+
+    Las ligas EU tienen clave numérica (ej: 39 → Premier League).
+    Las ligas ESPN tienen clave string (ej: 501 → 'Liga BetPlay') porque
+    no están en LIGAS y el fit() usa league_name como fallback de clave.
+
+    Retorna el nombre si se encuentra, None si no.
+    """
+    try:
+        from config.settings import LIGAS_ESPN, COMPETICIONES_NACIONALES_ESPN
+        _todos = {**LIGAS_ESPN, **COMPETICIONES_NACIONALES_ESPN}
+        return next(
+            (name for slug, (lid, name) in _todos.items() if lid == league_id),
+            None,
+        )
+    except Exception:
+        return None
 
 
 # ─── DIXON-COLES (por liga) ───────────────────────────────────────────────────
@@ -153,19 +187,16 @@ class DixonColesModel:
         x0[2*n]     =  0.1   # home_adv inicial
         x0[2*n + 1] = -0.1   # rho inicial
 
-        # ── L-BFGS-B: mucho más rápido que SLSQP en alta dimensionalidad ──
-        # Sin constraints de equality — el modelo converge igual sin ellos
-        # porque la log-verosimilitud se estabiliza naturalmente.
         result = minimize(
             self._neg_log_likelihood,
             x0,
             args=(teams, home_teams, away_teams, home_goals, away_goals),
             method="L-BFGS-B",
             options={
-                "maxiter": 200,    # suficiente para converger
-                "ftol":    1e-6,   # tolerancia razonable
+                "maxiter": 200,
+                "ftol":    1e-6,
                 "gtol":    1e-5,
-                "maxfun":  15000,  # hard stop: máximo de evaluaciones de función
+                "maxfun":  15000,
             },
         )
 
@@ -249,9 +280,9 @@ class DixonColesEnsemble:
     """
     Contenedor de modelos DC por liga + modelo global como fallback.
 
-    v5: el modelo global se omite si hay más de MAX_TEAMS_GLOBAL_DC equipos
-    para evitar inestabilidad numérica y tiempos de entrenamiento excesivos.
-    En ese caso el fallback son los modelos por liga individuales.
+    v5: el modelo global se omite si hay más de MAX_TEAMS_GLOBAL_DC equipos.
+    v6: predict_proba resuelve league_id numérico → league_name para ligas
+        ESPN que se guardaron con nombre como clave durante el fit().
     """
 
     def __init__(self):
@@ -269,7 +300,6 @@ class DixonColesEnsemble:
                 f"Se omite el modelo global para evitar inestabilidad. "
                 f"Las ligas individuales actuarán como fallback entre sí."
             )
-            # Placeholder sin fit — predict_proba usará _default_proba
             self.models["global"] = DixonColesModel(league_id="global")
         else:
             global_model = DixonColesModel(league_id="global").fit(df)
@@ -281,6 +311,8 @@ class DixonColesEnsemble:
         # ── Modelos por liga ──────────────────────────────────────────────
         if "league_name" in df.columns:
             for league_name, group in df.groupby("league_name"):
+                # Intentar mapear a league_id numérico (ligas EU)
+                # Para ligas ESPN no está en LIGAS → usa league_name como clave
                 lid = next(
                     (lid for lid, (ln, _, _) in LIGAS.items() if ln == league_name),
                     league_name,
@@ -289,7 +321,7 @@ class DixonColesEnsemble:
                 model = DixonColesModel(league_id=lid).fit(group)
                 if model.fitted:
                     self.models[lid] = model
-                    log.info(f"  DC {league_name}: OK")
+                    log.info(f"  DC {league_name}: OK (clave={repr(lid)})")
                 else:
                     log.warning(
                         f"  DC {league_name}: insuficientes datos, "
@@ -306,18 +338,31 @@ class DixonColesEnsemble:
 
     def predict_proba(self, home_team: str, away_team: str,
                       league_id: int | str = None) -> dict:
-        # Intentar modelo de la liga específica
+
+        # 1. Buscar por league_id exacto (ligas EU — clave numérica)
         if league_id is not None and league_id in self.models:
             model = self.models[league_id]
             if model.fitted:
                 return model.predict_proba(home_team, away_team)
 
-        # Fallback al modelo global
+        # 2. Resolver league_id numérico → league_name para ligas ESPN/LATAM
+        #    Ej: 501 → 'Liga BetPlay', 502 → 'Liga Profesional Argentina'
+        if league_id is not None:
+            league_name = _resolve_league_name(league_id)
+            if league_name and league_name in self.models:
+                model = self.models[league_name]
+                if model.fitted:
+                    log.debug(
+                        f"DC: resuelto league_id={league_id} → '{league_name}'"
+                    )
+                    return model.predict_proba(home_team, away_team)
+
+        # 3. Fallback al modelo global
         global_model = self.models.get("global")
         if global_model and global_model.fitted:
             return global_model.predict_proba(home_team, away_team)
 
-        # Último fallback: cualquier liga entrenada
+        # 4. Último fallback: cualquier liga entrenada
         for lid, model in self.models.items():
             if model.fitted:
                 log.debug(f"Usando DC de liga {lid} como fallback para {home_team}")
@@ -326,7 +371,14 @@ class DixonColesEnsemble:
         return DixonColesModel()._default_proba()
 
     def get_model_for_league(self, league_id) -> DixonColesModel:
-        return self.models.get(league_id, self.models.get("global"))
+        # Intentar clave directa
+        if league_id in self.models:
+            return self.models[league_id]
+        # Intentar resolución por nombre (ligas ESPN)
+        league_name = _resolve_league_name(league_id)
+        if league_name and league_name in self.models:
+            return self.models[league_name]
+        return self.models.get("global")
 
 
 # ─── CALIBRACIÓN ─────────────────────────────────────────────────────────────
@@ -477,13 +529,29 @@ class FootbotEnsemble:
             dc_rows = []
             for _, row in val_df.iterrows():
                 from src._02_feature_builder import normalize_team_name
+
+                # FIX v6: resolver league_id para ligas EU Y ESPN
                 lid = None
                 if "league_name" in row:
+                    # Buscar en ligas EU primero (clave numérica)
                     lid = next(
                         (k for k, (ln, _, _) in LIGAS.items()
                          if ln == row["league_name"]),
                         None,
                     )
+                    # Si no está en EU, buscar en ligas ESPN por nombre
+                    if lid is None:
+                        try:
+                            from config.settings import LIGAS_ESPN, COMPETICIONES_NACIONALES_ESPN
+                            _todos = {**LIGAS_ESPN, **COMPETICIONES_NACIONALES_ESPN}
+                            lid = next(
+                                (league_id for slug, (league_id, name) in _todos.items()
+                                 if name == row["league_name"]),
+                                None,
+                            )
+                        except Exception:
+                            pass
+
                 probs = dc_ensemble.predict_proba(
                     normalize_team_name(str(row.get("home_team", ""))),
                     normalize_team_name(str(row.get("away_team", ""))),
