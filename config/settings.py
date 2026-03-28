@@ -5,14 +5,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ─── API KEYS ────────────────────────────────────────────────────────────────
-FOOTBALL_DATA_ORG_KEY = os.getenv("FOOTBALL_DATA_ORG_KEY", "")   # football-data.org (free, permanente)
+FOOTBALL_DATA_ORG_KEY = os.getenv("FOOTBALL_DATA_ORG_KEY", "")
 TELEGRAM_TOKEN        = os.getenv("TELEGRAM_TOKEN",   "TU_BOT_TOKEN_AQUI")
 TELEGRAM_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID", "TU_CHAT_ID_AQUI")
 SUPABASE_URL          = os.getenv("SUPABASE_URL",     "TU_SUPABASE_URL_AQUI")
 SUPABASE_KEY          = os.getenv("SUPABASE_KEY",     "TU_SUPABASE_ANON_KEY_AQUI")
-
-# Mantenemos API_FOOTBALL_KEY como fallback opcional para result_updater
-API_FOOTBALL_KEY      = os.getenv("API_FOOTBALL_KEY", "")
+API_FOOTBALL_KEY      = os.getenv("API_FOOTBALL_KEY", "")   # usado por pipeline nacional
 
 # ─── TEMPORADA DINÁMICA ───────────────────────────────────────────────────────
 def current_season() -> int:
@@ -32,7 +30,7 @@ def _build_seasons(n: int = 5) -> list[str]:
 
 FOOTBALL_DATA_SEASONS = _build_seasons(5)
 
-# ─── LIGAS ACTIVAS ────────────────────────────────────────────────────────────
+# ─── LIGAS DE CLUBES ─────────────────────────────────────────────────────────
 # league_id (football-data.org) → (nombre, fd_code Football-Data.co.uk, fdorg_id)
 LIGAS = {
     39:  ("Premier League", "E0", 2021),
@@ -44,6 +42,17 @@ LIGAS = {
     94:  ("Primeira Liga",  "P1",  2017),
 }
 
+# ─── COMPETICIONES DE SELECCIONES NACIONALES (API-Football) ──────────────────
+# league_id → {nombre, temporada, tier}
+COMPETICIONES_NACIONALES = {
+    361: {"nombre": "Eliminatorias CONMEBOL", "temporada": 2026, "tier": 1},
+    271: {"nombre": "Copa América",           "temporada": 2024, "tier": 1},
+    1:   {"nombre": "Copa del Mundo",         "temporada": 2026, "tier": 1},
+}
+
+# IDs de ligas oficiales de selecciones (no amistosos)
+TIER_1_NATIONAL_LEAGUES = {361, 271, 1, 4, 5}
+
 # ─── UMBRALES DE CONFIANZA ────────────────────────────────────────────────────
 UMBRAL_EDGE_ALTA   = 8.0
 UMBRAL_EDGE_MEDIA  = 4.0
@@ -53,13 +62,18 @@ MIN_PARTIDOS_ALTA  = 30
 MIN_PARTIDOS_MEDIA = 15
 KELLY_FRACCION     = 0.25
 
+# Umbrales más bajos para selecciones (menos partidos disponibles)
+MIN_PARTIDOS_ALTA_NACIONAL  = 15
+MIN_PARTIDOS_MEDIA_NACIONAL = 8
+
 # ─── MODELO ───────────────────────────────────────────────────────────────────
-VENTANA_FORMA     = 10
-LAMBDA_DECAY      = 0.02
-XGB_N_ESTIMATORS  = 300
-XGB_MAX_DEPTH     = 4
-XGB_LEARNING_RATE = 0.05
-RANDOM_SEED       = 42
+VENTANA_FORMA          = 10
+VENTANA_FORMA_NACIONAL = 8
+LAMBDA_DECAY           = 0.02
+XGB_N_ESTIMATORS       = 300
+XGB_MAX_DEPTH          = 4
+XGB_LEARNING_RATE      = 0.05
+RANDOM_SEED            = 42
 
 # ─── RATE LIMITS ─────────────────────────────────────────────────────────────
 API_FOOTBALL_DAILY_LIMIT = 100
@@ -77,7 +91,7 @@ MODELS_DIR     = os.path.join(BASE_DIR, "models")
 LOGS_DIR       = os.path.join(BASE_DIR, "logs")
 
 # ─── URLs EXTERNAS ────────────────────────────────────────────────────────────
-FOOTBALL_DATA_URL    = "https://www.football-data.co.uk/mmz4281"
-FOOTBALL_DATA_ORG_URL= "https://api.football-data.org/v4"
-OPENMETEO_URL        = "https://api.open-meteo.com/v1/forecast"
-CLUBELO_URL          = "http://api.clubelo.com"
+FOOTBALL_DATA_URL     = "https://www.football-data.co.uk/mmz4281"
+FOOTBALL_DATA_ORG_URL = "https://api.football-data.org/v4"
+OPENMETEO_URL         = "https://api.open-meteo.com/v1/forecast"
+CLUBELO_URL           = "http://api.clubelo.com"

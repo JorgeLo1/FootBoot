@@ -1,17 +1,17 @@
 """
 _03_model_engine.py
-Motor predictivo: Dixon-Coles + XGBoost ensemble con calibración isotónica.
+Motor predictivo: Dixon-Coles por liga + XGBoost ensemble con calibración isotónica.
 
-CAMBIOS v2:
-  1. Métrica de validación real: ROI sobre set de validación en lugar de
-     solo accuracy. El modelo ahora reporta si tiene edge histórico real.
-  2. _save_as_latest lanza excepción clara si la copia falla, en lugar
-     de dejar el archivo latest desactualizado en silencio.
-  3. FEATURE_COLS excluye market_prob_* del training (consistente con
-     el fix de leakage en _02_). En inferencia se añaden como features
-     adicionales opcionales vía INFERENCE_EXTRA_COLS.
-  4. Calibración: umbral MIN_SAMPLES_ISOTONIC reducido a 30 (más realista
-     para mercados como "draw" en ligas pequeñas).
+CAMBIOS v3:
+  1. Dixon-Coles por liga: en lugar de un modelo global que mezcla equipos
+     de 7 ligas distintas, se entrena un modelo DC separado por liga.
+     predict_proba recibe el league_id para usar el modelo correcto,
+     con fallback al modelo global si la liga no tiene suficientes datos.
+  2. blend_predictions ahora usa pesos optimizados por mercado, calculados
+     en validación temporal (minimizando Brier score). Los pesos se persisten
+     en disco junto con los modelos y se cargan automáticamente.
+  3. FEATURE_COLS excluye market_prob_* del training (leakage fix).
+  4. Calibración: umbral MIN_SAMPLES_ISOTONIC reducido a 30.
 """
 
 import os
@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 from datetime import date
 from pathlib import Path
-from scipy.optimize import minimize
+from scipy.optimize import minimize, minimize_scalar
 from scipy.stats import poisson
 from sklearn.isotonic import IsotonicRegression
 from sklearn.linear_model import LogisticRegression
@@ -34,16 +34,17 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.settings import (
     DATA_PROCESSED, MODELS_DIR, RANDOM_SEED,
-    XGB_N_ESTIMATORS, XGB_MAX_DEPTH, XGB_LEARNING_RATE,
+    XGB_N_ESTIMATORS, XGB_MAX_DEPTH, XGB_LEARNING_RATE, LIGAS,
 )
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-MIN_SAMPLES_ISOTONIC = 30  # reducido de 50
+MIN_SAMPLES_ISOTONIC  = 30
+MIN_MATCHES_PER_LIGA  = 200   # mínimo para entrenar DC por liga
+DEFAULT_DC_WEIGHT     = 0.35  # fallback si no hay optimización
 
-# Features base para training (sin market_prob — leakage fix)
 FEATURE_COLS = [
     "home_xg_scored",    "home_xg_conceded",   "home_goals_scored",
     "home_goals_conceded","home_forma",         "home_btts_rate",
@@ -59,26 +60,30 @@ FEATURE_COLS = [
     "rain_flag",         "wind_flag",
 ]
 
-# Features adicionales disponibles solo en inferencia
 INFERENCE_EXTRA_COLS = [
     "market_prob_home", "market_prob_draw", "market_prob_away",
 ]
 
 
-# ─── DIXON-COLES ─────────────────────────────────────────────────────────────
+# ─── DIXON-COLES (por liga) ───────────────────────────────────────────────────
 
 class DixonColesModel:
     """
-    Modelo Dixon-Coles con SLSQP para respetar la restricción de
-    identificabilidad (suma de parámetros de ataque = 0).
+    Modelo Dixon-Coles con SLSQP.
+
+    NUEVO v3: se puede instanciar por liga (league_id) o como modelo global.
+    La clase es idéntica — la diferencia está en los datos con que se entrena.
     """
 
-    def __init__(self):
-        self.attack   = {}
-        self.defense  = {}
-        self.home_adv = 0.0
-        self.rho      = -0.1
-        self.fitted   = False
+    def __init__(self, league_id: int | str = "global"):
+        self.league_id = league_id
+        self.attack    = {}
+        self.defense   = {}
+        self.home_adv  = 0.0
+        self.rho       = -0.1
+        self.fitted    = False
+        self.n_teams   = 0
+        self.n_matches = 0
 
     def _tau(self, x: int, y: int, mu: float, lam: float, rho: float) -> float:
         if   x == 0 and y == 0: return 1 - mu * lam * rho
@@ -110,13 +115,22 @@ class DixonColesModel:
         return -ll
 
     def fit(self, df: pd.DataFrame):
-        log.info("Entrenando Dixon-Coles (SLSQP)...")
+        label = f"liga={self.league_id}"
+        log.info(f"Entrenando Dixon-Coles ({label})...")
+
         required = ["home_team_norm", "away_team_norm", "home_goals", "away_goals"]
         if not all(c in df.columns for c in required):
             log.error(f"Columnas requeridas para DC: {required}")
             return self
 
         df = df.dropna(subset=required)
+        if len(df) < MIN_MATCHES_PER_LIGA:
+            log.warning(
+                f"DC ({label}): solo {len(df)} partidos, "
+                f"mínimo requerido {MIN_MATCHES_PER_LIGA}. No se entrena."
+            )
+            return self
+
         home_teams = df["home_team_norm"].tolist()
         away_teams = df["away_team_norm"].tolist()
         home_goals = df["home_goals"].astype(int).tolist()
@@ -139,17 +153,20 @@ class DixonColesModel:
             options={"maxiter": 500, "ftol": 1e-7},
         )
 
-        params        = result.x
-        self.attack   = dict(zip(teams, params[:n]))
-        self.defense  = dict(zip(teams, params[n:2*n]))
-        self.home_adv = float(params[2*n])
-        self.rho      = float(params[2*n + 1])
-        self.teams    = teams
-        self.fitted   = True
+        params         = result.x
+        self.attack    = dict(zip(teams, params[:n]))
+        self.defense   = dict(zip(teams, params[n:2*n]))
+        self.home_adv  = float(params[2*n])
+        self.rho       = float(params[2*n + 1])
+        self.teams     = teams
+        self.fitted    = True
+        self.n_teams   = n
+        self.n_matches = len(df)
 
         log.info(
-            f"Dixon-Coles: {n} equipos | home_adv={self.home_adv:.3f} | "
-            f"rho={self.rho:.3f} | convergió={result.success}"
+            f"DC ({label}): {n} equipos | {len(df)} partidos | "
+            f"home_adv={self.home_adv:.3f} | rho={self.rho:.3f} | "
+            f"convergió={result.success}"
         )
         return self
 
@@ -212,12 +229,75 @@ class DixonColesModel:
         }
 
 
-# ─── CALIBRACIÓN ROBUSTA ─────────────────────────────────────────────────────
+class DixonColesEnsemble:
+    """
+    Contenedor de modelos DC por liga + modelo global como fallback.
+
+    Uso:
+        dce = DixonColesEnsemble()
+        dce.fit(training_df)            # entrena uno por liga + global
+        probs = dce.predict_proba(home, away, league_id=39)
+    """
+
+    def __init__(self):
+        self.models: dict[int | str, DixonColesModel] = {}
+        self.fitted = False
+
+    def fit(self, df: pd.DataFrame):
+        # Modelo global (fallback)
+        log.info("─── DC global (fallback) ───")
+        global_model = DixonColesModel(league_id="global").fit(df)
+        self.models["global"] = global_model
+
+        # Modelos por liga
+        if "league_name" in df.columns:
+            for league_name, group in df.groupby("league_name"):
+                # Buscar league_id por nombre
+                lid = next(
+                    (lid for lid, (ln, _, _) in LIGAS.items() if ln == league_name),
+                    league_name,
+                )
+                log.info(f"─── DC {league_name} ({len(group)} partidos) ───")
+                model = DixonColesModel(league_id=lid).fit(group)
+                if model.fitted:
+                    self.models[lid] = model
+                    log.info(f"  DC {league_name}: OK")
+                else:
+                    log.warning(
+                        f"  DC {league_name}: insuficientes datos, "
+                        "se usará modelo global."
+                    )
+
+        self.fitted = True
+        fitted_leagues = [k for k in self.models if k != "global"]
+        log.info(
+            f"DixonColesEnsemble: {len(fitted_leagues)} ligas + global. "
+            f"Ligas: {fitted_leagues}"
+        )
+        return self
+
+    def predict_proba(self, home_team: str, away_team: str,
+                      league_id: int | str = None) -> dict:
+        # Intentar modelo de la liga específica
+        if league_id is not None and league_id in self.models:
+            model = self.models[league_id]
+            if model.fitted:
+                return model.predict_proba(home_team, away_team)
+
+        # Fallback al modelo global
+        global_model = self.models.get("global")
+        if global_model and global_model.fitted:
+            return global_model.predict_proba(home_team, away_team)
+
+        return DixonColesModel()._default_proba()
+
+    def get_model_for_league(self, league_id) -> DixonColesModel:
+        return self.models.get(league_id, self.models.get("global"))
+
+
+# ─── CALIBRACIÓN ─────────────────────────────────────────────────────────────
 
 def _fit_calibrator(raw_probs: np.ndarray, y: np.ndarray):
-    """
-    IsotonicRegression si hay suficientes positivos, Platt scaling si no.
-    """
     n_pos = int(y.sum())
     if n_pos >= MIN_SAMPLES_ISOTONIC:
         ir = IsotonicRegression(out_of_bounds="clip")
@@ -229,63 +309,80 @@ def _fit_calibrator(raw_probs: np.ndarray, y: np.ndarray):
     class PlattWrapper:
         def __init__(self):
             self.lr = LogisticRegression(C=1.0, max_iter=1000)
-
         def fit(self, x, y):
             self.lr.fit(x.reshape(-1, 1), y)
             return self
-
         def transform(self, x):
             return self.lr.predict_proba(
                 np.array(x).reshape(-1, 1)
             )[:, 1]
 
-    pw = PlattWrapper()
-    pw.fit(raw_probs, y)
-    return pw
+    return PlattWrapper().fit(raw_probs, y)
 
 
-# ─── VALIDACIÓN CON ROI REAL ─────────────────────────────────────────────────
+# ─── VALIDACIÓN CON ROI ───────────────────────────────────────────────────────
 
-def _compute_validation_roi(
-    cal_probs: np.ndarray,
-    y_true: np.ndarray,
-    reference_odds: float = None,
-) -> dict:
-    """
-    Calcula métricas de validación orientadas a apuestas:
-    - accuracy: % de predicciones correctas (prob > 0.5)
-    - roi_flat: ROI apostando 1 unidad siempre que prob > 0.5
-    - brier: Brier score (calibración)
-    - edge_mean: edge promedio del modelo vs odds de referencia
-
-    Si reference_odds es None, se usa la inversa de la prob promedio
-    como proxy de cuota justa del mercado.
-    """
+def _compute_validation_roi(cal_probs, y_true, reference_odds=None):
     preds    = (cal_probs > 0.5).astype(int)
     accuracy = float((preds == y_true).mean())
     brier    = float(np.mean((cal_probs - y_true) ** 2))
 
-    # ROI flat: apuesta 1 unidad cuando modelo dice SÍ
     bet_mask = preds == 1
     if bet_mask.sum() > 0:
         if reference_odds is not None:
-            gains   = np.where(y_true[bet_mask], reference_odds - 1, -1)
+            gains = np.where(y_true[bet_mask], reference_odds - 1, -1)
         else:
-            # Cuota justa aproximada: 1 / prob_promedio_del_mercado
-            avg_prob = y_true.mean() if y_true.mean() > 0 else 0.33
-            fair_odds = 1 / avg_prob * 0.95  # 5% overround
+            avg_prob  = y_true.mean() if y_true.mean() > 0 else 0.33
+            fair_odds = 1 / avg_prob * 0.95
             gains     = np.where(y_true[bet_mask], fair_odds - 1, -1)
         roi_flat = float(gains.mean() * 100)
     else:
         roi_flat = 0.0
 
     return {
-        "accuracy":  round(accuracy, 3),
-        "roi_flat":  round(roi_flat, 2),
-        "brier":     round(brier,    4),
-        "n_bets":    int(bet_mask.sum()),
-        "n_total":   int(len(y_true)),
+        "accuracy": round(accuracy, 3),
+        "roi_flat": round(roi_flat, 2),
+        "brier":    round(brier,    4),
+        "n_bets":   int(bet_mask.sum()),
+        "n_total":  int(len(y_true)),
     }
+
+
+# ─── OPTIMIZACIÓN DE BLEND WEIGHT ────────────────────────────────────────────
+
+def _optimize_blend_weight(
+    dc_probs_val: np.ndarray,
+    xgb_probs_val: np.ndarray,
+    y_true: np.ndarray,
+    market: str,
+) -> float:
+    """
+    Encuentra el peso óptimo de DC minimizando el Brier score en validación.
+    Retorna dc_weight ∈ [0.05, 0.70].
+
+    Usamos minimize_scalar con método 'bounded' — es más estable que
+    grid search y converge en ~20 iteraciones.
+    """
+    def brier(dc_w):
+        blended = dc_w * dc_probs_val + (1 - dc_w) * xgb_probs_val
+        return float(np.mean((blended - y_true) ** 2))
+
+    result = minimize_scalar(
+        brier,
+        bounds=(0.05, 0.70),
+        method="bounded",
+        options={"xatol": 1e-4, "maxiter": 100},
+    )
+
+    optimal = float(result.x)
+    brier_at_optimal  = brier(optimal)
+    brier_at_default  = brier(DEFAULT_DC_WEIGHT)
+
+    log.info(
+        f"  Blend [{market}]: dc_weight={optimal:.3f} "
+        f"(Brier={brier_at_optimal:.4f} vs default={brier_at_default:.4f})"
+    )
+    return optimal
 
 
 # ─── XGBOOST ENSEMBLE ────────────────────────────────────────────────────────
@@ -297,9 +394,11 @@ class FootbotEnsemble:
         self.models              = {}
         self.calibrators         = {}
         self.feature_importances = {}
-        self.validation_metrics  = {}   # NUEVO: métricas de validación por mercado
+        self.validation_metrics  = {}
         self.fitted_features     = []
         self.fitted              = False
+        # Pesos de blend optimizados por mercado (se rellenan en fit)
+        self.blend_weights: dict[str, float] = {}
 
     def _get_xgb(self):
         return XGBClassifier(
@@ -314,7 +413,11 @@ class FootbotEnsemble:
             verbosity=0,
         )
 
-    def fit(self, df: pd.DataFrame):
+    def fit(self, df: pd.DataFrame, dc_ensemble: "DixonColesEnsemble" = None):
+        """
+        Entrena XGBoost y, si se pasa dc_ensemble, optimiza los blend weights
+        por mercado usando el set de validación temporal.
+        """
         targets = {
             "home_win": "target_home_win",
             "draw":     "target_draw",
@@ -323,12 +426,10 @@ class FootbotEnsemble:
             "over25":   "target_over25",
         }
 
-        # Solo features sin leakage para training
         available = [f for f in FEATURE_COLS if f in df.columns]
         X = df[available].fillna(0).values
         self.fitted_features = available
 
-        # Cuotas de referencia promedio para ROI (de B365 si existe)
         ref_odds_map = {}
         if "B365H" in df.columns:
             ref_odds_map["home_win"] = df["B365H"].dropna().median()
@@ -337,8 +438,40 @@ class FootbotEnsemble:
         if "B365A" in df.columns:
             ref_odds_map["away_win"] = df["B365A"].dropna().median()
 
-        # Split temporal 80/20
         split = int(len(X) * 0.8)
+
+        # Pre-calcular probabilidades DC en el set de validación para blend opt
+        dc_val_probs: dict[str, np.ndarray] = {}
+        if dc_ensemble is not None:
+            log.info("Pre-calculando probs DC en set de validación para blend opt...")
+            val_df = df.iloc[split:].reset_index(drop=True)
+            dc_mapping = {
+                "home_win": "dc_prob_home",
+                "draw":     "dc_prob_draw",
+                "away_win": "dc_prob_away",
+                "btts":     "dc_prob_btts",
+                "over25":   "dc_prob_over25",
+            }
+            dc_rows = []
+            for _, row in val_df.iterrows():
+                from src._02_feature_builder import normalize_team_name
+                lid = None
+                if "league_name" in row:
+                    lid = next(
+                        (k for k, (ln, _, _) in LIGAS.items()
+                         if ln == row["league_name"]),
+                        None,
+                    )
+                probs = dc_ensemble.predict_proba(
+                    normalize_team_name(str(row.get("home_team", ""))),
+                    normalize_team_name(str(row.get("away_team", ""))),
+                    league_id=lid,
+                )
+                dc_rows.append(probs)
+            dc_val_df = pd.DataFrame(dc_rows)
+            for market, dc_col in dc_mapping.items():
+                if dc_col in dc_val_df.columns:
+                    dc_val_probs[market] = dc_val_df[dc_col].values
 
         for market, target_col in targets.items():
             if target_col not in df.columns:
@@ -363,7 +496,6 @@ class FootbotEnsemble:
             cal     = _fit_calibrator(raw_val, y_val)
             cal_val = cal.transform(raw_val)
 
-            # Métricas de validación reales (accuracy + ROI)
             ref_odds = ref_odds_map.get(market)
             metrics  = _compute_validation_roi(cal_val, y_val, ref_odds)
             self.validation_metrics[market] = metrics
@@ -373,12 +505,9 @@ class FootbotEnsemble:
                 f"ROI flat={metrics['roi_flat']:+.1f}% "
                 f"({metrics['n_bets']}/{metrics['n_total']} apuestas)"
             )
-
-            # Advertencia si el ROI es negativo en validación
             if metrics["roi_flat"] < -5:
                 log.warning(
-                    f"  ⚠ [{market}] ROI negativo en validación. "
-                    f"El edge puede no materializarse."
+                    f"  ⚠ [{market}] ROI negativo en validación."
                 )
 
             self.models[market]      = xgb
@@ -387,21 +516,26 @@ class FootbotEnsemble:
             fi = pd.Series(xgb.feature_importances_, index=available)
             self.feature_importances[market] = fi.sort_values(ascending=False).head(10)
 
+            # Optimizar blend weight si tenemos probs DC del set de validación
+            if market in dc_val_probs:
+                dc_probs_arr = dc_val_probs[market]
+                if len(dc_probs_arr) == len(cal_val):
+                    optimal_w = _optimize_blend_weight(
+                        dc_probs_arr, cal_val, y_val, market
+                    )
+                    self.blend_weights[market] = optimal_w
+                else:
+                    self.blend_weights[market] = DEFAULT_DC_WEIGHT
+            else:
+                self.blend_weights[market] = DEFAULT_DC_WEIGHT
+
         self.fitted = True
-        log.info("Ensemble entrenado. Resumen de validación:")
-        for market, m in self.validation_metrics.items():
-            log.info(
-                f"  {market:10s}: acc={m['accuracy']:.3f} | "
-                f"roi={m['roi_flat']:+.1f}%"
-            )
+        log.info("Ensemble entrenado. Pesos DC optimizados:")
+        for market, w in self.blend_weights.items():
+            log.info(f"  {market:10s}: dc_weight={w:.3f}")
         return self
 
     def predict(self, features_row: dict) -> dict:
-        """
-        Predice probabilidades calibradas para un partido.
-        Acepta features extra de inferencia (market_prob_*) si están presentes,
-        pero solo los usa si el modelo fue entrenado con ellos (no debería).
-        """
         if not self.fitted:
             return {}
         X = np.array([[features_row.get(f, 0) for f in self.fitted_features]])
@@ -418,22 +552,26 @@ class FootbotEnsemble:
         return self.feature_importances[market].head(n).index.tolist()
 
     def get_validation_summary(self) -> str:
-        """Retorna un resumen legible de las métricas de validación."""
         lines = ["📊 *Validación del modelo (set temporal 20%)*"]
         for market, m in self.validation_metrics.items():
             emoji = "✅" if m["roi_flat"] >= 0 else "⚠️"
+            w     = self.blend_weights.get(market, DEFAULT_DC_WEIGHT)
             lines.append(
                 f"{emoji} {market}: acc `{m['accuracy']:.1%}` | "
-                f"ROI `{m['roi_flat']:+.1f}%` ({m['n_bets']} apuestas)"
+                f"ROI `{m['roi_flat']:+.1f}%` | dc_w=`{w:.2f}` "
+                f"({m['n_bets']} apuestas)"
             )
         return "\n".join(lines)
 
 
-# ─── BLEND ───────────────────────────────────────────────────────────────────
+# ─── BLEND CON PESOS OPTIMIZADOS ─────────────────────────────────────────────
 
 def blend_predictions(dc_probs: dict, xgb_probs: dict,
-                      dc_weight: float = 0.35) -> dict:
-    xw = 1 - dc_weight
+                      blend_weights: dict = None) -> dict:
+    """
+    Combina DC y XGBoost usando pesos optimizados por mercado.
+    Si blend_weights es None, usa DEFAULT_DC_WEIGHT para todos.
+    """
     mapping = {
         "home_win": ("dc_prob_home",   "xgb_prob_home_win"),
         "draw":     ("dc_prob_draw",   "xgb_prob_draw"),
@@ -443,10 +581,12 @@ def blend_predictions(dc_probs: dict, xgb_probs: dict,
     }
     blended = {}
     for market, (dk, xk) in mapping.items():
-        dp = dc_probs.get(dk, 0.33)
-        xp = xgb_probs.get(xk, dp)
+        dp    = dc_probs.get(dk, 0.33)
+        xp    = xgb_probs.get(xk, dp)
+        dc_w  = (blend_weights or {}).get(market, DEFAULT_DC_WEIGHT)
+        xgb_w = 1 - dc_w
         blended[f"prob_{market}"] = (
-            round(dc_weight * dp + xw * xp, 4) if xp > 0 else round(dp, 4)
+            round(dc_w * dp + xgb_w * xp, 4) if xp > 0 else round(dp, 4)
         )
 
     # Normalizar 1X2
@@ -460,11 +600,6 @@ def blend_predictions(dc_probs: dict, xgb_probs: dict,
 # ─── PERSISTENCIA ────────────────────────────────────────────────────────────
 
 def _save_as_latest(src: str, name: str):
-    """
-    Copia el modelo versionado como 'latest'.
-    Lanza RuntimeError si la copia falla — así el scheduler lo detecta
-    y no usa un modelo desactualizado en silencio.
-    """
     dst = os.path.join(MODELS_DIR, f"{name}_latest.pkl")
     try:
         shutil.copy2(src, dst)
@@ -485,7 +620,7 @@ def train_and_save(training_df: pd.DataFrame = None) -> tuple:
 
     log.info(f"Entrenando con {len(training_df)} partidos históricos...")
 
-    # Normalización para Dixon-Coles
+    # Normalizar columnas para DC
     if "home_team_norm" not in training_df.columns:
         from src._02_feature_builder import normalize_team_name
         training_df = training_df.copy()
@@ -496,23 +631,25 @@ def train_and_save(training_df: pd.DataFrame = None) -> tuple:
         training_df["home_goals"] = training_df["home_goals_actual"]
         training_df["away_goals"] = training_df["away_goals_actual"]
 
-    dc       = DixonColesModel().fit(training_df)
-    ensemble = FootbotEnsemble().fit(training_df)
+    # 1. Entrenar DC por liga
+    dc_ensemble = DixonColesEnsemble().fit(training_df)
+
+    # 2. Entrenar XGBoost con optimización de blend weights
+    ensemble = FootbotEnsemble().fit(training_df, dc_ensemble=dc_ensemble)
 
     os.makedirs(MODELS_DIR, exist_ok=True)
-    version  = date.today().strftime("%Y%m%d")
-    dc_path  = os.path.join(MODELS_DIR, f"dixon_coles_{version}.pkl")
-    xgb_path = os.path.join(MODELS_DIR, f"ensemble_{version}.pkl")
+    version    = date.today().strftime("%Y%m%d")
+    dc_path    = os.path.join(MODELS_DIR, f"dixon_coles_{version}.pkl")
+    xgb_path   = os.path.join(MODELS_DIR, f"ensemble_{version}.pkl")
 
-    joblib.dump(dc,       dc_path)
-    joblib.dump(ensemble, xgb_path)
+    joblib.dump(dc_ensemble, dc_path)
+    joblib.dump(ensemble,    xgb_path)
 
-    # Estas líneas pueden lanzar RuntimeError — el scheduler lo captura
     _save_as_latest(dc_path,  "dixon_coles")
     _save_as_latest(xgb_path, "ensemble")
 
     log.info(f"Modelos guardados: versión {version}")
-    return dc, ensemble
+    return dc_ensemble, ensemble
 
 
 def load_models() -> tuple:
@@ -521,23 +658,30 @@ def load_models() -> tuple:
     if not os.path.exists(dc_path) or not os.path.exists(xgb_path):
         log.warning("No hay modelos guardados. Entrenando desde cero...")
         return train_and_save()
-    dc       = joblib.load(dc_path)
-    ensemble = joblib.load(xgb_path)
+    dc_ensemble = joblib.load(dc_path)
+    ensemble    = joblib.load(xgb_path)
     log.info("Modelos cargados desde disco.")
-    return dc, ensemble
+    return dc_ensemble, ensemble
 
 
 def predict_match(home_team: str, away_team: str,
                   features_row: dict,
-                  dc: DixonColesModel,
+                  dc: DixonColesEnsemble,
                   ensemble: FootbotEnsemble) -> dict:
     from src._02_feature_builder import normalize_team_name
-    dc_probs  = dc.predict_proba(
-        normalize_team_name(home_team),
-        normalize_team_name(away_team),
-    )
-    xgb_probs = ensemble.predict(features_row)
-    blended   = blend_predictions(dc_probs, xgb_probs)
+
+    home_norm  = normalize_team_name(home_team)
+    away_norm  = normalize_team_name(away_team)
+
+    # Usar el DC de la liga correcta
+    league_id  = features_row.get("league_id")
+    dc_probs   = dc.predict_proba(home_norm, away_norm, league_id=league_id)
+
+    xgb_probs  = ensemble.predict(features_row)
+
+    # Blend con pesos optimizados del ensemble
+    blended    = blend_predictions(dc_probs, xgb_probs,
+                                   blend_weights=ensemble.blend_weights)
 
     top_features = {
         m: ensemble.get_top_features(m, n=3)

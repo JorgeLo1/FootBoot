@@ -2,16 +2,17 @@
 _02_feature_builder.py
 Construye todas las variables predictivas para cada partido.
 
-CORRECCIONES v2:
-  1. _compute_xg (defense): ahora distingue local/visitante correctamente
-     y no confunde los partidos del equipo con partidos de rivales.
-  2. compute_team_stats: expone n_matches_total (histórico completo)
-     además de n_matches (ventana de forma), para que el confidence
-     classifier use el conteo correcto.
+CAMBIOS v3:
+  1. normalize_team_name usa rapidfuzz para matching robusto en lugar de
+     un diccionario hardcodeado. Fallback a limpieza básica si rapidfuzz
+     no está instalado.
+  2. TeamNameResolver construye un vocabulario canónico desde los datos
+     históricos reales y resuelve nombres de la API contra ese vocabulario.
+     Esto elimina el problema silencioso de equipos sin histórico por
+     diferencias de nombre entre fuentes.
   3. build_training_dataset: el feature market_prob_* se excluye del
      training set (data leakage) y se añade solo en inferencia.
-  4. build_training_dataset: optimización O(n log n) via índice por equipo
-     en lugar de recortar el DataFrame completo en cada iteración.
+  4. build_training_dataset: optimización O(n log n) via índice por equipo.
 """
 
 import os
@@ -33,6 +34,138 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
+# ─── FUZZY MATCHING ───────────────────────────────────────────────────────────
+
+try:
+    from rapidfuzz import process as fuzz_process, fuzz
+    _HAS_RAPIDFUZZ = True
+    log.debug("rapidfuzz disponible — usando fuzzy matching.")
+except ImportError:
+    _HAS_RAPIDFUZZ = False
+    log.warning(
+        "rapidfuzz no instalado. Usando normalización básica. "
+        "Instala con: pip install rapidfuzz"
+    )
+
+# Prefijos y sufijos comunes a eliminar antes del matching
+_STRIP_TOKENS = [
+    "fc", "cf", "ac", "sc", "rc", "cd", "sd", "ud", "rcd", "real",
+    "atletico", "athletic", "sporting", "deportivo",
+    "united", "city", "town", "rovers", "wanderers", "hotspur",
+    "saint", "st", "borussia", "bayer", "rb", "ss", "as",
+]
+
+# Umbral de similaridad mínimo para aceptar un match fuzzy
+_FUZZY_THRESHOLD = 82
+
+
+def _clean_name(name: str) -> str:
+    """Limpieza básica: minúsculas, sin puntuación, sin prefijos comunes."""
+    import re
+    s = name.lower().strip()
+    s = re.sub(r"['\-\.]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # Eliminar tokens genéricos solo si no es el nombre completo
+    tokens = s.split()
+    if len(tokens) > 1:
+        tokens = [t for t in tokens if t not in _STRIP_TOKENS]
+    return " ".join(tokens) if tokens else s
+
+
+class TeamNameResolver:
+    """
+    Construye un vocabulario canónico de nombres de equipo a partir de los
+    datos históricos (Football-Data.co.uk) y resuelve nombres externos
+    (football-data.org, StatsBomb) contra ese vocabulario usando fuzzy matching.
+
+    Uso:
+        resolver = TeamNameResolver()
+        resolver.build_from_historical(historical_df)
+        canonical = resolver.resolve("Manchester City FC")  # → "man city"
+    """
+
+    def __init__(self):
+        self._canonical: list[str] = []          # nombres canónicos (ya normalizados)
+        self._raw_to_canonical: dict[str, str] = {}  # caché de resoluciones
+        self._built = False
+
+    def build_from_historical(self, historical: pd.DataFrame):
+        """Extrae todos los nombres únicos del histórico como vocabulario canónico."""
+        if historical.empty:
+            log.warning("TeamNameResolver: histórico vacío, sin vocabulario.")
+            return
+
+        teams = set()
+        for col in ["home_team", "away_team"]:
+            if col in historical.columns:
+                teams.update(historical[col].dropna().unique())
+
+        self._canonical = sorted({_clean_name(t) for t in teams})
+        self._raw_to_canonical = {}
+        self._built = True
+        log.info(f"TeamNameResolver: {len(self._canonical)} equipos en vocabulario.")
+
+    def resolve(self, name: str) -> str:
+        """
+        Resuelve un nombre externo al nombre canónico más cercano.
+        Primero busca en caché; si no, intenta fuzzy match; si falla, devuelve
+        la versión limpiada del nombre original.
+        """
+        if not name:
+            return ""
+
+        # 1. Caché
+        if name in self._raw_to_canonical:
+            return self._raw_to_canonical[name]
+
+        cleaned = _clean_name(name)
+
+        # 2. Match exacto tras limpieza
+        if cleaned in self._canonical:
+            self._raw_to_canonical[name] = cleaned
+            return cleaned
+
+        # 3. Fuzzy match
+        if _HAS_RAPIDFUZZ and self._built and self._canonical:
+            result = fuzz_process.extractOne(
+                cleaned,
+                self._canonical,
+                scorer=fuzz.token_sort_ratio,
+                score_cutoff=_FUZZY_THRESHOLD,
+            )
+            if result:
+                matched, score, _ = result
+                log.debug(f"Fuzzy match: '{name}' → '{matched}' (score={score})")
+                self._raw_to_canonical[name] = matched
+                return matched
+
+        # 4. Fallback: nombre limpiado sin match
+        log.debug(f"Sin match para '{name}', usando nombre limpiado: '{cleaned}'")
+        self._raw_to_canonical[name] = cleaned
+        return cleaned
+
+    def resolve_series(self, series: pd.Series) -> pd.Series:
+        return series.apply(self.resolve)
+
+
+# Instancia global — se inicializa con build_from_historical() al cargar datos
+_resolver = TeamNameResolver()
+
+
+def normalize_team_name(name: str) -> str:
+    """
+    Punto de entrada público. Usa el resolver global si está construido,
+    o limpieza básica en caso contrario.
+    """
+    if _resolver._built:
+        return _resolver.resolve(name)
+    return _clean_name(name)
+
+
+def init_resolver(historical: pd.DataFrame):
+    """Inicializa el resolver global con el histórico. Llamar antes del pipeline."""
+    _resolver.build_from_historical(historical)
+
 
 # ─── HELPERS ─────────────────────────────────────────────────────────────────
 
@@ -40,45 +173,16 @@ def exponential_weight(days_ago: float, lam: float = LAMBDA_DECAY) -> float:
     return np.exp(-lam * max(days_ago, 0))
 
 
-def normalize_team_name(name: str) -> str:
-    mappings = {
-        "manchester united":       "man united",
-        "manchester city":         "man city",
-        "tottenham hotspur":       "tottenham",
-        "wolverhampton wanderers": "wolves",
-        "wolverhampton":           "wolves",
-        "newcastle united":        "newcastle",
-        "brighton & hove albion":  "brighton",
-        "nottingham forest":       "nott'm forest",
-        "paris saint-germain":     "paris sg",
-        "atletico madrid":         "atletico madrid",
-        "atletico de madrid":      "atletico madrid",
-        "fc barcelona":            "barcelona",
-        "real madrid cf":          "real madrid",
-        "borussia dortmund":       "dortmund",
-        "bayer leverkusen":        "leverkusen",
-        "rb leipzig":              "rb leipzig",
-        "eintracht frankfurt":     "frankfurt",
-        "internazionale":          "inter",
-        "inter milan":             "inter",
-        "ac milan":                "ac milan",
-        "ss lazio":                "lazio",
-        "as roma":                 "roma",
-        "olympique lyonnais":      "lyon",
-        "olympique de marseille":  "marseille",
-    }
-    return mappings.get(name.lower().strip(), name.lower().strip())
-
-
 # ─── CARGA DE DATOS ───────────────────────────────────────────────────────────
 
 def load_historical_results() -> pd.DataFrame:
     frames = []
-    for _, (_, fd_code) in LIGAS.items():
+    for _, (league_name, fd_code, _) in LIGAS.items():
         path = os.path.join(DATA_RAW, f"fd_{fd_code}.csv")
         if os.path.exists(path):
             df = pd.read_csv(path, encoding="latin-1", on_bad_lines="skip")
-            df["fd_code"] = fd_code
+            df["fd_code"]     = fd_code
+            df["league_name"] = league_name
             frames.append(df)
 
     if not frames:
@@ -106,6 +210,10 @@ def load_historical_results() -> pd.DataFrame:
     raw["away_goals"] = pd.to_numeric(raw["away_goals"], errors="coerce")
     raw = raw.dropna(subset=["home_goals", "away_goals"])
 
+    # Inicializar resolver con nombres canónicos del histórico
+    init_resolver(raw)
+
+    # Normalizar usando el resolver ya construido
     raw["home_team_norm"] = raw["home_team"].apply(normalize_team_name)
     raw["away_team_norm"] = raw["away_team"].apply(normalize_team_name)
 
@@ -124,7 +232,6 @@ def load_xg_data() -> pd.DataFrame:
         return pd.DataFrame()
     df = pd.read_csv(path)
     df["team_norm"] = df["team"].apply(normalize_team_name)
-    # Añadir columna de rol (home/away) si no existe
     if "is_home_team" not in df.columns:
         df["is_home_team"] = df["team"] == df["home_team"]
     return df
@@ -150,20 +257,10 @@ def load_elo() -> pd.DataFrame:
     return df
 
 
-# ─── xG CORREGIDO ────────────────────────────────────────────────────────────
+# ─── xG ──────────────────────────────────────────────────────────────────────
 
 def _compute_xg(team_norm: str, xg_data: pd.DataFrame,
                 is_home: bool, mode: str) -> float:
-    """
-    Calcula xG promedio de un equipo desde StatsBomb.
-
-    CORRECCIÓN v2 (respecto a ambas versiones anteriores):
-    - mode='attack': shots realizados por el equipo → xG ofensivo
-    - mode='defense': shots recibidos del rival en los mismos partidos
-      Ahora filtramos por rol (local/visitante) para no mezclar
-      partidos donde el equipo jugaba de local con partidos de visitante,
-      lo que producía conteos erróneos en la versión anterior.
-    """
     if xg_data.empty or "shot_statsbomb_xg" not in xg_data.columns:
         return 0.0
 
@@ -175,13 +272,8 @@ def _compute_xg(team_norm: str, xg_data: pd.DataFrame,
         n = team_shots["match_id"].nunique()
         return float(team_shots["shot_statsbomb_xg"].sum() / max(n, 1))
 
-    # defense: shots del rival en los mismos partidos del equipo
     team_match_ids = team_shots["match_id"].unique()
-
-    # Si tenemos la columna is_home_team, filtramos por el rol correcto
     if "is_home_team" in xg_data.columns:
-        # En los partidos donde nuestro equipo era local,
-        # los rivales eran visitantes, y viceversa
         rival_is_home = not is_home
         rival_shots = xg_data[
             xg_data["match_id"].isin(team_match_ids) &
@@ -189,7 +281,6 @@ def _compute_xg(team_norm: str, xg_data: pd.DataFrame,
             (xg_data["is_home_team"] == rival_is_home)
         ]
     else:
-        # Fallback: cualquier shot del rival en esos partidos
         rival_shots = xg_data[
             xg_data["match_id"].isin(team_match_ids) &
             (xg_data["team_norm"] != team_norm)
@@ -207,18 +298,18 @@ def _compute_xg(team_norm: str, xg_data: pd.DataFrame,
 def _empty_team_stats(is_home: bool) -> dict:
     p = "home" if is_home else "away"
     return {
-        f"{p}_xg_scored":      1.2,
-        f"{p}_xg_conceded":    1.2,
-        f"{p}_goals_scored":   1.2,
-        f"{p}_goals_conceded": 1.2,
-        f"{p}_forma":          1.2,
-        f"{p}_btts_rate":      0.5,
-        f"{p}_over25_rate":    0.5,
-        f"{p}_corners_avg":    5.0,
-        f"{p}_fouls_avg":      11.0,
-        f"{p}_days_rest":      7,
-        f"{p}_n_matches":      0,
-        f"{p}_n_matches_total":0,   # NUEVO: total histórico disponible
+        f"{p}_xg_scored":       1.2,
+        f"{p}_xg_conceded":     1.2,
+        f"{p}_goals_scored":    1.2,
+        f"{p}_goals_conceded":  1.2,
+        f"{p}_forma":           1.2,
+        f"{p}_btts_rate":       0.5,
+        f"{p}_over25_rate":     0.5,
+        f"{p}_corners_avg":     5.0,
+        f"{p}_fouls_avg":       11.0,
+        f"{p}_days_rest":       7,
+        f"{p}_n_matches":       0,
+        f"{p}_n_matches_total": 0,
     }
 
 
@@ -243,28 +334,18 @@ def compute_team_stats(team: str, is_home: bool,
                        match_summary: pd.DataFrame,
                        reference_date: datetime,
                        window: int = VENTANA_FORMA) -> dict:
-    """
-    Calcula estadísticas históricas de un equipo con decaimiento temporal.
-
-    NUEVO v2: retorna n_matches_total (todos los partidos disponibles antes
-    de reference_date) además de n_matches (solo los de la ventana de forma).
-    El confidence classifier usa n_matches_total para no penalizar equipos
-    que simplemente no han jugado en las últimas N jornadas.
-    """
     team_norm  = normalize_team_name(team)
     p          = "home" if is_home else "away"
     col_team   = "home_team_norm" if is_home else "away_team_norm"
     col_scored = "home_goals"     if is_home else "away_goals"
     col_recv   = "away_goals"     if is_home else "home_goals"
 
-    # Todos los partidos históricos del equipo (para n_matches_total)
     df_all = historical[
         (historical[col_team] == team_norm) &
         (historical["match_date"] < reference_date)
     ]
     n_total = len(df_all)
 
-    # Ventana de forma (últimos `window` partidos ponderados)
     df = df_all.sort_values("match_date", ascending=False).head(window).copy()
 
     if df.empty:
@@ -312,7 +393,7 @@ def compute_team_stats(team: str, is_home: bool,
         f"{p}_fouls_avg":       round(fouls_avg,     2),
         f"{p}_days_rest":       days_rest,
         f"{p}_n_matches":       len(df),
-        f"{p}_n_matches_total": n_total,   # NUEVO
+        f"{p}_n_matches_total": n_total,
     }
 
 
@@ -376,10 +457,7 @@ def get_elo_diff(home_team: str, away_team: str, elo_df: pd.DataFrame) -> float:
 def _extract_market_features(home: str, away: str,
                               historical: pd.DataFrame,
                               ref_date: datetime) -> dict:
-    """
-    Probabilidades implícitas de cuotas de cierre históricas.
-    SOLO para inferencia — NO incluir en el training set (data leakage).
-    """
+    """Solo para inferencia — NO incluir en training set."""
     h = normalize_team_name(home)
     a = normalize_team_name(away)
     default = {"market_prob_home": 0.45, "market_prob_draw": 0.27,
@@ -416,11 +494,6 @@ def _extract_market_features(home: str, away: str,
 # ─── BUILDER PRINCIPAL ───────────────────────────────────────────────────────
 
 def build_features_for_fixtures(fixtures: pd.DataFrame) -> pd.DataFrame:
-    """
-    Genera features completos para todos los partidos del día.
-    Incluye market_prob_* (solo en inferencia, no en training).
-    Usa n_matches_total para el confidence classifier.
-    """
     log.info("Cargando datos históricos para feature building...")
     historical    = load_historical_results()
     xg_data       = load_xg_data()
@@ -437,6 +510,15 @@ def build_features_for_fixtures(fixtures: pd.DataFrame) -> pd.DataFrame:
     for _, fixture in fixtures.iterrows():
         home = fixture["home_team"]
         away = fixture["away_team"]
+
+        # Log de resolución de nombres para debugging
+        home_norm = normalize_team_name(home)
+        away_norm = normalize_team_name(away)
+        if home_norm != home.lower().strip():
+            log.info(f"  Nombre resuelto: '{home}' → '{home_norm}'")
+        if away_norm != away.lower().strip():
+            log.info(f"  Nombre resuelto: '{away}' → '{away_norm}'")
+
         log.info(f"Features: {home} vs {away}")
 
         home_stats = compute_team_stats(home, True,  historical, xg_data,
@@ -447,20 +529,18 @@ def build_features_for_fixtures(fixtures: pd.DataFrame) -> pd.DataFrame:
         elo_diff   = get_elo_diff(home, away, elo_df)
         weather    = get_weather_for_fixture(
                         home, fixture.get("date", ref_date.isoformat()))
-        # market_prob: OK en inferencia
         market     = _extract_market_features(home, away, historical, ref_date)
 
         all_features.append({
-            "fixture_id":          fixture.get("fixture_id", 0),
-            "league_id":           fixture.get("league_id", 0),
-            "league_name":         fixture.get("league_name", ""),
-            "home_team":           home,
-            "away_team":           away,
-            "match_date":          fixture.get("date", str(ref_date.date())),
-            # Usar total histórico para el value detector
-            "n_home_matches":      home_stats.get("home_n_matches_total", 0),
-            "n_away_matches":      away_stats.get("away_n_matches_total", 0),
-            "elo_diff":            elo_diff,
+            "fixture_id":      fixture.get("fixture_id", 0),
+            "league_id":       fixture.get("league_id", 0),
+            "league_name":     fixture.get("league_name", ""),
+            "home_team":       home,
+            "away_team":       away,
+            "match_date":      fixture.get("date", str(ref_date.date())),
+            "n_home_matches":  home_stats.get("home_n_matches_total", 0),
+            "n_away_matches":  away_stats.get("away_n_matches_total", 0),
+            "elo_diff":        elo_diff,
             **home_stats,
             **away_stats,
             **h2h,
@@ -490,22 +570,10 @@ def _add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ─── DATASET DE ENTRENAMIENTO (OPTIMIZADO + SIN LEAKAGE) ─────────────────────
+# ─── DATASET DE ENTRENAMIENTO ────────────────────────────────────────────────
 
 def build_training_dataset(historical: pd.DataFrame) -> pd.DataFrame:
-    """
-    Dataset walk-forward optimizado y sin data leakage.
-
-    OPTIMIZACIÓN v2: en lugar de recortar el DataFrame en cada iteración
-    (O(n²)), pre-indexamos por equipo. Para cada partido en posición idx,
-    solo buscamos partidos anteriores del equipo usando el índice, no
-    cargando historical.iloc[:idx] completo en memoria.
-
-    LEAKAGE FIX: market_prob_* se EXCLUYE del training dataset.
-    El modelo debe aprender a superar el mercado sin verlo durante el
-    entrenamiento — si lo ve, aprende a replicarlo en lugar de superarlo.
-    Los features de mercado se añaden solo en inferencia (build_features_for_fixtures).
-    """
+    """Dataset walk-forward optimizado y sin data leakage."""
     log.info("Construyendo dataset walk-forward (optimizado, sin leakage)...")
 
     xg_data       = load_xg_data()
@@ -515,24 +583,13 @@ def build_training_dataset(historical: pd.DataFrame) -> pd.DataFrame:
     historical = historical.sort_values("match_date").reset_index(drop=True)
     start_idx  = max(200, len(historical) // 4)
 
-    # Pre-índices por equipo para lookup O(1) en lugar de scan completo
-    home_idx: dict[str, list[int]] = {}
-    away_idx: dict[str, list[int]] = {}
-    for i, row in historical.iterrows():
-        h = row.get("home_team_norm", normalize_team_name(str(row.get("home_team", ""))))
-        a = row.get("away_team_norm", normalize_team_name(str(row.get("away_team", ""))))
-        home_idx.setdefault(h, []).append(i)
-        away_idx.setdefault(a, []).append(i)
-
     training_rows = []
     total_range   = len(historical) - start_idx
 
     for idx in range(start_idx, len(historical)):
         match    = historical.iloc[idx]
         ref_date = match["match_date"]
-
-        # Datos anteriores al partido actual
-        past = historical.iloc[:idx]
+        past     = historical.iloc[:idx]
 
         home = str(match.get("home_team", ""))
         away = str(match.get("away_team", ""))
@@ -545,7 +602,6 @@ def build_training_dataset(historical: pd.DataFrame) -> pd.DataFrame:
                                         match_summary, ref_date)
         h2h        = compute_h2h(home, away, past, ref_date)
         elo_diff   = get_elo_diff(home, away, elo_df)
-        # ↓ NO incluir market_prob aquí (data leakage)
 
         hg = int(match["home_goals"])
         ag = int(match["away_goals"])
@@ -554,14 +610,13 @@ def build_training_dataset(historical: pd.DataFrame) -> pd.DataFrame:
             "home_team":           home,
             "away_team":           away,
             "match_date":          ref_date,
+            "league_name":         match.get("league_name", ""),
             "elo_diff":            elo_diff,
-            # n_matches_total correcto (conteo antes del partido)
             "n_home_matches":      home_stats.get("home_n_matches_total", 0),
             "n_away_matches":      away_stats.get("away_n_matches_total", 0),
             **home_stats,
             **away_stats,
             **h2h,
-            # target variables
             "target_home_win":     int(hg > ag),
             "target_draw":         int(hg == ag),
             "target_away_win":     int(hg < ag),
@@ -578,7 +633,6 @@ def build_training_dataset(historical: pd.DataFrame) -> pd.DataFrame:
     df = pd.DataFrame(training_rows)
     if not df.empty:
         df = _add_derived_features(df)
-        # Añadir columnas norm para Dixon-Coles
         if "home_team_norm" not in df.columns:
             df["home_team_norm"] = df["home_team"].apply(normalize_team_name)
             df["away_team_norm"] = df["away_team"].apply(normalize_team_name)
