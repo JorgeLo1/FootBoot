@@ -1,15 +1,16 @@
 """
 _01_data_collector.py
-Descarga y normaliza todas las fuentes de datos:
-  - Fixtures del día vía API-Football (con rate-limit tracker)
-  - Resultados históricos + CUOTAS REALES de Football-Data.co.uk
-  - Datos de eventos (xG, tiros, corners) de StatsBomb Open Data
-  - Ratings ELO de ClubElo.com
-  - Clima de Open-Meteo (sin API key)
+Descarga y normaliza todas las fuentes de datos.
+
+Fuente de fixtures: football-data.org (free tier permanente, sin expiración).
+Fuente de datos históricos + cuotas: Football-Data.co.uk (CSVs gratuitos).
+Fuente de ELO: ClubElo.com (sin API key).
+Fuente de clima: Open-Meteo (sin API key).
 """
 
 import os
 import sys
+import time
 import logging
 import requests
 import pandas as pd
@@ -18,12 +19,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.settings import (
-    API_FOOTBALL_KEY, API_USAGE_FILE, API_FOOTBALL_DAILY_LIMIT,
+    FOOTBALL_DATA_ORG_KEY, FOOTBALL_DATA_ORG_URL,
     LIGAS, DATA_RAW, DATA_STATSBOMB,
     FOOTBALL_DATA_URL, FOOTBALL_DATA_SEASONS,
     CLUBELO_URL, CURRENT_SEASON,
 )
-from src.utils import get_weather_for_fixture, ApiRateLimiter  # noqa: F401 — re-exportar
+from src.utils import get_weather_for_fixture, ApiRateLimiter  # noqa: F401
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,39 +33,39 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Instancia global del rate limiter (se comparte con result_updater)
-rate_limiter = ApiRateLimiter(API_USAGE_FILE, API_FOOTBALL_DAILY_LIMIT)
 
-
-# ─── FIXTURES DEL DÍA ────────────────────────────────────────────────────────
+# ─── FIXTURES DEL DÍA (football-data.org) ────────────────────────────────────
 
 def get_fixtures_today() -> pd.DataFrame:
-    today = date.today().strftime("%Y-%m-%d")
+    """
+    Obtiene los partidos del día desde football-data.org.
+    Free tier permanente: 10 req/min → time.sleep(6) entre ligas.
+    """
+    if not FOOTBALL_DATA_ORG_KEY:
+        log.error(
+            "FOOTBALL_DATA_ORG_KEY no configurada. "
+            "Regístrate en football-data.org (gratis) y añádela al .env"
+        )
+        return pd.DataFrame()
+
+    today   = date.today().strftime("%Y-%m-%d")
     headers = {"X-Auth-Token": FOOTBALL_DATA_ORG_KEY}
-    
-    # IDs de football-data.org (distintos a API-Football)
-    COMPETITION_IDS = {
-        2021: ("Premier League",  39),
-        2014: ("La Liga",        140),
-        2002: ("Bundesliga",      78),
-        2019: ("Serie A",        135),
-        2015: ("Ligue 1",         61),
-        2003: ("Eredivisie",      88),
-        2017: ("Primeira Liga",   94),
-    }
-    
+
     all_fixtures = []
-    for comp_id, (league_name, league_id) in COMPETITION_IDS.items():
+    for league_id, (league_name, _, fdorg_id) in LIGAS.items():
         try:
             resp = requests.get(
-                f"https://api.football-data.org/v4/competitions/{comp_id}/matches",
+                f"{FOOTBALL_DATA_ORG_URL}/competitions/{fdorg_id}/matches",
                 headers=headers,
                 params={"dateFrom": today, "dateTo": today},
                 timeout=10,
             )
             resp.raise_for_status()
-            
+
             for match in resp.json().get("matches", []):
+                # Solo partidos programados o en juego
+                if match["status"] not in ("SCHEDULED", "TIMED", "IN_PLAY", "FINISHED"):
+                    continue
                 all_fixtures.append({
                     "fixture_id":  match["id"],
                     "date":        match["utcDate"],
@@ -76,43 +77,76 @@ def get_fixtures_today() -> pd.DataFrame:
                     "venue_city":  "",
                     "status":      match["status"],
                 })
-            time.sleep(6)  # respetar 10 req/min
-            
+            log.info(f"✓ Fixtures {league_name}: OK")
         except Exception as e:
             log.warning(f"Error fixtures {league_name}: {e}")
-    
+
+        time.sleep(6)  # respetar 10 req/min del free tier
+
     df = pd.DataFrame(all_fixtures)
     if not df.empty:
         path = os.path.join(DATA_RAW, f"fixtures_{today}.csv")
         df.to_csv(path, index=False)
-        log.info(f"Fixtures guardados: {len(df)} partidos")
+        log.info(f"Fixtures guardados: {len(df)} partidos → {path}")
+    else:
+        log.info("No hay partidos hoy en las ligas activas.")
     return df
 
 
-# ─── DATOS HISTÓRICOS + CUOTAS REALES ────────────────────────────────────────
+# ─── RESULTADOS DEL DÍA (football-data.org) ──────────────────────────────────
 
-# Columnas de cuotas que interesan (múltiples casas para tener la mejor odds)
-ODDS_COLS = [
-    # Bet365
-    "B365H", "B365D", "B365A",
-    # Betway / Blue Square
-    "BWH",   "BWD",   "BWA",
-    # Pinnacle (las más eficientes del mercado)
-    "PSH",   "PSD",   "PSA",
-    # Mercados de goles
-    "B365>2.5", "B365<2.5",
-    # BTTS (si existe en el CSV)
-    "B365AHH",
-]
+def get_results_fdorg(target_date: str) -> dict:
+    """
+    Obtiene resultados finalizados de football-data.org para una fecha.
+    Usado como fuente principal (y fallback) en result_updater.
+    Retorna dict: {(home_team, away_team): {home_goals, away_goals, ...}}
+    """
+    if not FOOTBALL_DATA_ORG_KEY:
+        return {}
 
+    headers = {"X-Auth-Token": FOOTBALL_DATA_ORG_KEY}
+    results = {}
+
+    for league_id, (league_name, _, fdorg_id) in LIGAS.items():
+        try:
+            resp = requests.get(
+                f"{FOOTBALL_DATA_ORG_URL}/competitions/{fdorg_id}/matches",
+                headers=headers,
+                params={"dateFrom": target_date, "dateTo": target_date,
+                        "status": "FINISHED"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+
+            for match in resp.json().get("matches", []):
+                score = match.get("score", {})
+                full  = score.get("fullTime", {})
+                hg    = full.get("home") or 0
+                ag    = full.get("away") or 0
+                results[(match["homeTeam"]["name"], match["awayTeam"]["name"])] = {
+                    "home_goals": int(hg),
+                    "away_goals": int(ag),
+                    "fixture_id": match["id"],
+                    "status":     match["status"],
+                }
+        except Exception as e:
+            log.warning(f"Error resultados fd.org {league_name}: {e}")
+
+        time.sleep(6)
+
+    log.info(f"Resultados fd.org: {len(results)} partidos finalizados")
+    return results
+
+
+# ─── DATOS HISTÓRICOS + CUOTAS (Football-Data.co.uk) ─────────────────────────
 
 def download_football_data() -> dict:
     """
     Descarga CSVs de Football-Data.co.uk para todas las ligas y temporadas.
-    Incluye columnas de cuotas reales (B365, Pinnacle) para el value detector.
+    Incluye cuotas reales (B365, Pinnacle) para el value detector.
     """
     dfs = {}
-    for league_id, (league_name, fd_code) in LIGAS.items():
+    for league_id, (league_name, fd_code, _) in LIGAS.items():
         frames = []
         for season in FOOTBALL_DATA_SEASONS:
             url = f"{FOOTBALL_DATA_URL}/{season}/{fd_code}.csv"
@@ -130,7 +164,7 @@ def download_football_data() -> dict:
             path = os.path.join(DATA_RAW, f"fd_{fd_code}.csv")
             combined.to_csv(path, index=False)
             dfs[fd_code] = combined
-            log.info(f"→ {fd_code}: {len(combined)} partidos totales guardados")
+            log.info(f"→ {fd_code}: {len(combined)} partidos totales")
 
     return dfs
 
@@ -140,7 +174,6 @@ def get_best_closing_odds(home_team: str, away_team: str,
     """
     Busca las últimas cuotas de cierre reales para un enfrentamiento.
     Prioridad: Pinnacle > Bet365 > Betway.
-    Retorna dict {home, draw, away, over25, under25} o None si no hay datos.
     """
     from src._02_feature_builder import normalize_team_name
 
@@ -150,16 +183,13 @@ def get_best_closing_odds(home_team: str, away_team: str,
     if "home_team_norm" not in historical.columns:
         return None
 
-    mask = (
-        (historical["home_team_norm"] == h) &
-        (historical["away_team_norm"] == a)
-    )
+    mask   = (historical["home_team_norm"] == h) & (historical["away_team_norm"] == a)
     recent = historical[mask].sort_values("match_date", ascending=False).head(3)
 
     for col_h, col_d, col_a in [
-        ("PSH", "PSD", "PSA"),
+        ("PSH",   "PSD",   "PSA"),
         ("B365H", "B365D", "B365A"),
-        ("BWH", "BWD", "BWA"),
+        ("BWH",   "BWD",   "BWA"),
     ]:
         if not all(c in recent.columns for c in [col_h, col_d, col_a]):
             continue
@@ -172,13 +202,12 @@ def get_best_closing_odds(home_team: str, away_team: str,
                 "home":    float(row[col_h]),
                 "draw":    float(row[col_d]),
                 "away":    float(row[col_a]),
-                # Over/Under 2.5 si existen
                 "over25":  float(recent["B365>2.5"].dropna().iloc[0])
-                           if "B365>2.5" in recent.columns and not recent["B365>2.5"].dropna().empty
-                           else None,
+                           if "B365>2.5" in recent.columns and
+                           not recent["B365>2.5"].dropna().empty else None,
                 "under25": float(recent["B365<2.5"].dropna().iloc[0])
-                           if "B365<2.5" in recent.columns and not recent["B365<2.5"].dropna().empty
-                           else None,
+                           if "B365<2.5" in recent.columns and
+                           not recent["B365<2.5"].dropna().empty else None,
                 "source":  col_h[:3],
             }
         except (ValueError, TypeError):
@@ -190,11 +219,7 @@ def get_best_closing_odds(home_team: str, away_team: str,
 # ─── STATSBOMB OPEN DATA ─────────────────────────────────────────────────────
 
 def download_statsbomb_data() -> dict:
-    """
-    Descarga datos de StatsBomb Open Data (gratis, sin API key).
-    Importante: solo cubre temporadas específicas históricas.
-    Los datos se guardan con timestamp para no mezclar con features actuales.
-    """
+    """Descarga datos de StatsBomb Open Data (gratis, sin API key)."""
     try:
         from statsbombpy import sb
 
@@ -212,81 +237,77 @@ def download_statsbomb_data() -> dict:
         for _, comp in target.iterrows():
             comp_id   = comp["competition_id"]
             season_id = comp["season_id"]
-
             try:
                 matches = sb.matches(competition_id=comp_id, season_id=season_id)
                 log.info(
                     f"StatsBomb: {comp['competition_name']} "
                     f"{comp['season_name']} → {len(matches)} partidos"
                 )
-
                 for _, match in matches.iterrows():
                     match_id = match["match_id"]
                     try:
                         events = sb.events(match_id=match_id)
-
-                        shots = events[events["type"] == "Shot"].copy()
+                        shots  = events[events["type"] == "Shot"].copy()
                         if not shots.empty:
                             shots["match_id"]    = match_id
                             shots["home_team"]   = match["home_team"]
                             shots["away_team"]   = match["away_team"]
+                            shots["is_home_team"]= shots["team"] == match["home_team"]
                             shots["competition"] = comp["competition_name"]
                             shots["season"]      = comp["season_name"]
                             all_shots.append(
                                 shots[["match_id", "team", "player",
                                        "shot_statsbomb_xg", "shot_outcome",
-                                       "home_team", "away_team",
+                                       "home_team", "away_team", "is_home_team",
                                        "competition", "season"]]
                             )
-
                         all_summary.append({
-                            "match_id":      match_id,
-                            "home_team":     match["home_team"],
-                            "away_team":     match["away_team"],
-                            "home_score":    match["home_score"],
-                            "away_score":    match["away_score"],
-                            "competition":   comp["competition_name"],
-                            "season":        comp["season_name"],
-                            "match_date":    match["match_date"],
-                            "corners_home":  len(events[
+                            "match_id":     match_id,
+                            "home_team":    match["home_team"],
+                            "away_team":    match["away_team"],
+                            "home_score":   match["home_score"],
+                            "away_score":   match["away_score"],
+                            "competition":  comp["competition_name"],
+                            "season":       comp["season_name"],
+                            "match_date":   match["match_date"],
+                            "corners_home": len(events[
                                 (events["type"] == "Pass") &
-                                (events["pass_type"] == "Corner") &
+                                (events.get("pass_type", "") == "Corner") &
                                 (events["team"] == match["home_team"])
                             ]),
-                            "corners_away":  len(events[
+                            "corners_away": len(events[
                                 (events["type"] == "Pass") &
-                                (events["pass_type"] == "Corner") &
+                                (events.get("pass_type", "") == "Corner") &
                                 (events["team"] == match["away_team"])
                             ]),
-                            "fouls_home":    len(events[
+                            "fouls_home":   len(events[
                                 (events["type"] == "Foul Committed") &
                                 (events["team"] == match["home_team"])
                             ]),
-                            "fouls_away":    len(events[
+                            "fouls_away":   len(events[
                                 (events["type"] == "Foul Committed") &
                                 (events["team"] == match["away_team"])
                             ]),
                         })
                     except Exception:
                         continue
-
             except Exception as e:
                 log.warning(f"Error StatsBomb {comp['competition_name']}: {e}")
 
         result = {}
         if all_shots:
-            df = pd.concat(all_shots, ignore_index=True)
+            df   = pd.concat(all_shots, ignore_index=True)
             path = os.path.join(DATA_STATSBOMB, "shots_xg.csv")
             df.to_csv(path, index=False)
             result["shots"] = df
-            log.info(f"StatsBomb shots: {len(df)} registros guardados")
+            log.info(f"StatsBomb shots: {len(df)} registros")
 
         if all_summary:
-            df = pd.DataFrame(all_summary)
+            df   = pd.DataFrame(all_summary)
             path = os.path.join(DATA_STATSBOMB, "match_summary.csv")
             df.to_csv(path, index=False)
             result["summary"] = df
-            log.info(f"StatsBomb resumen: {len(df)} partidos guardados")
+            log.info(f"StatsBomb resumen: {len(df)} partidos")
 
         return result
 
@@ -298,26 +319,18 @@ def download_statsbomb_data() -> dict:
 # ─── ELO RATINGS ─────────────────────────────────────────────────────────────
 
 def download_elo_ratings() -> pd.DataFrame:
-    """
-    Descarga ratings ELO actuales de ClubElo.com (gratis, sin API key).
-    Tiene fallback al día anterior si el server no responde.
-    """
-    for days_back in range(0, 4):  # intenta hoy, ayer, anteayer, etc.
+    """Descarga ratings ELO de ClubElo.com con fallback a días anteriores."""
+    for days_back in range(0, 4):
         target = (date.today() - timedelta(days=days_back)).strftime("%Y-%m-%d")
         try:
-            url = f"{CLUBELO_URL}/{target}"
-            df  = pd.read_csv(url)
+            df   = pd.read_csv(f"{CLUBELO_URL}/{target}")
             path = os.path.join(DATA_RAW, "elo_ratings.csv")
             df.to_csv(path, index=False)
-            if days_back == 0:
-                log.info(f"ELO ratings actualizados: {len(df)} equipos")
-            else:
-                log.info(f"ELO ratings de hace {days_back}d: {len(df)} equipos")
+            log.info(f"ELO ratings: {len(df)} equipos (hace {days_back}d)")
             return df
         except Exception:
             continue
 
-    # Último recurso: archivo en caché
     path = os.path.join(DATA_RAW, "elo_ratings.csv")
     if os.path.exists(path):
         log.warning("Usando ELO ratings del último archivo en caché.")
@@ -331,10 +344,10 @@ def download_elo_ratings() -> pd.DataFrame:
 
 def run():
     log.info("═══ FOOTBOT · Recolección de datos ═══")
-    fixtures    = get_fixtures_today()
-    fd_data     = download_football_data()
-    sb_data     = download_statsbomb_data()
-    elo         = download_elo_ratings()
+    fixtures = get_fixtures_today()
+    fd_data  = download_football_data()
+    sb_data  = download_statsbomb_data()
+    elo      = download_elo_ratings()
     log.info("═══ Recolección completada ═══")
     return {"fixtures": fixtures, "football_data": fd_data,
             "statsbomb": sb_data, "elo": elo}

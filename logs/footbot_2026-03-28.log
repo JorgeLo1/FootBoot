@@ -1,0 +1,15 @@
+2026-03-28 10:12:57,779 [INFO] =======================================================
+2026-03-28 10:12:57,780 [INFO]   FOOTBOT -- 2026-03-28 10:12  
+2026-03-28 10:12:57,780 [INFO] =======================================================
+2026-03-28 10:12:59,407 [INFO] Re-entrenar modelo hoy: True
+2026-03-28 10:12:59,408 [INFO] 
+> PASO 1 -- Recoleccion de datos
+2026-03-28 10:13:00,947 [INFO] ✓ Fixtures Premier League: OK
+2026-03-28 10:13:08,134 [INFO] ✓ Fixtures La Liga: OK
+2026-03-28 10:13:15,272 [INFO] ✓ Fixtures Bundesliga: OK
+2026-03-28 10:13:22,433 [INFO] ✓ Fixtures Serie A: OK
+2026-03-28 10:13:29,889 [INFO] ✓ Fixtures Ligue 1: OK
+2026-03-28 10:13:37,077 [INFO] ✓ Fixtures Eredivisie: OK
+2026-03-28 10:13:44,302 [INFO] ✓ Fixtures Primeira Liga: OK
+2026-03-28 10:13:50,304 [INFO] No hay partidos hoy en las ligas activas.
+2026-03-28 10:13:56,882 [ERROR] Error enviando a Telegram: 404 Client Error: Not Found for url: https://api.telegram.org/bottu_token_del_bot/sendMessage
