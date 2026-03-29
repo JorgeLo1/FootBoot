@@ -109,6 +109,15 @@ MIN_PARTIDOS_ALTA  = 30
 MIN_PARTIDOS_MEDIA = 15
 KELLY_FRACCION     = 0.25
 
+# ── Nivel BAJA (nuevo) ────────────────────────────────────────────────────────
+# Solo se activa con cuotas reales (ESPN o fd.co.uk).
+# Requiere edge positivo mínimo y probabilidad razonable.
+# Para mercados 1X2 y Over/Under estándar: edge >= 2% y prob >= 52%.
+# Restricción de partidos mínimos más laxa para equipos con poco historial.
+UMBRAL_EDGE_BAJA   = 2.0
+UMBRAL_PROB_BAJA   = 0.52
+MIN_PARTIDOS_BAJA  = 6
+
 # Umbrales más bajos para selecciones (menos partidos disponibles)
 MIN_PARTIDOS_ALTA_NACIONAL  = 15
 MIN_PARTIDOS_MEDIA_NACIONAL = 8

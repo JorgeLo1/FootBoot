@@ -1,14 +1,31 @@
 """
-_04_value_detector.py — v5
+_04_value_detector.py — v6
 Detecta value bets comparando probabilidades del modelo con cuotas del mercado.
 
-MERCADOS EXPANDIDOS:
+CAMBIOS v6:
+  Tres niveles de confianza: alta, media y baja.
+
+  - ALTA  (edge >= 8%,  prob >= 62%, n >= 30): señal fuerte, kelly 2-3.5%
+  - MEDIA (edge >= 4%,  prob >= 55%, n >= 15): señal moderada, kelly 0.5-1.5%
+  - BAJA  (edge >= 2%,  prob >= 52%, n >= 6):  señal débil, solo con cuotas
+                                                reales (ESPN o fd.co.uk).
+                                                kelly reducido al 50%.
+
+  El nivel BAJA tiene estas restricciones adicionales:
+    1. SOLO se emite con cuotas reales (espn_live, exact_match,
+       contextual_avg, fd_historical). Con model_implied nunca.
+    2. SOLO para mercados estándar (1X2, Over/Under, BTTS, Doble oportunidad,
+       AH estándar). Los mercados nicho (exactos, combinadas) ya tienen
+       umbrales propios en model_implied.
+    3. Kelly se aplica al 50% de la fracción normal para reflejar
+       la menor certeza estadística.
+
+MERCADOS EXPANDIDOS (sin cambios desde v5):
   - Goles totales: Over/Under 0.5, 1.5, 2.5, 3.5, 4.5
   - Goles por equipo: Over/Under 0.5 y 1.5 local y visitante
   - Goles exactos: 0, 1, 2, 3, 4+ goles
   - Combinadas: BTTS + resultado
-  - Asian Handicap: usa spread real ESPN cuando está disponible,
-    con fallback a ±0.5 calculado desde las probabilidades
+  - Asian Handicap: usa spread real ESPN cuando está disponible
   - 1X2 y Doble Oportunidad
 
 CUOTAS ESPN INTEGRADAS (schema confirmado Core API /odds):
@@ -21,8 +38,6 @@ ESTRATEGIA model_implied (sin cuotas reales):
   tan eficiente que sin referencia externa el edge es ruido.
   Mercados nicho (exactos, por equipo, combinadas, AH nicho): permitidos
   solo con umbral elevado (+12%/+8%) Y prob > 65%.
-  Justificación: el modelo tiene información asimétrica en mercados nicho
-  (xG real + DC por liga) que el mercado implícito promedio no captura.
 """
 
 import os
@@ -36,9 +51,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.settings import (
-    UMBRAL_EDGE_ALTA,  UMBRAL_EDGE_MEDIA,
-    UMBRAL_PROB_ALTA,  UMBRAL_PROB_MEDIA,
-    MIN_PARTIDOS_ALTA, MIN_PARTIDOS_MEDIA,
+    UMBRAL_EDGE_ALTA,  UMBRAL_EDGE_MEDIA,  UMBRAL_EDGE_BAJA,
+    UMBRAL_PROB_ALTA,  UMBRAL_PROB_MEDIA,  UMBRAL_PROB_BAJA,
+    MIN_PARTIDOS_ALTA, MIN_PARTIDOS_MEDIA, MIN_PARTIDOS_BAJA,
     KELLY_FRACCION,    DATA_PROCESSED,
     UMBRAL_EDGE_ALTA_ESPN, UMBRAL_EDGE_MEDIA_ESPN,
 )
@@ -67,6 +82,19 @@ _MERCADOS_BLOQUEADOS_MODEL_IMPLIED = {
     "home_win", "draw", "away_win",
     "over25", "under25",
     "double_1x", "double_x2", "double_12",
+}
+
+# Mercados permitidos en nivel BAJA — solo estándar con cuotas reales
+# Los nicho tienen sus propios umbrales elevados en model_implied
+_MERCADOS_NIVEL_BAJA = {
+    "home_win", "draw", "away_win",
+    "btts_si", "btts_no",
+    "over15", "under15",
+    "over25", "under25",
+    "over35", "under35",
+    "double_1x", "double_x2", "double_12",
+    "ah_home_minus05", "ah_away_minus05",
+    "ah_home_plus05",  "ah_away_plus05",
 }
 
 # Cuotas fallback — SOLO si no hay ninguna fuente real ni ESPN
@@ -147,11 +175,11 @@ def compute_all_market_probs(mu: float, lam: float) -> dict:
     p_draw_btts = float(sum(M[i][j] for i in range(1,n+1) for j in range(1,n+1) if i == j))
     p_away_btts = float(sum(M[i][j] for i in range(1,n+1) for j in range(1,n+1) if j > i))
 
-    # AH estándar ±0.5 (desde probabilidades — se mejora con spread ESPN real)
-    p_ah_home_minus05 = p_home              # local gana (sin empate)
-    p_ah_away_minus05 = p_away + p_draw     # visitante gana o empata
-    p_ah_home_plus05  = p_home + p_draw     # local gana o empata
-    p_ah_away_plus05  = p_away              # visitante gana
+    # AH estándar ±0.5
+    p_ah_home_minus05 = p_home
+    p_ah_away_minus05 = p_away + p_draw
+    p_ah_home_plus05  = p_home + p_draw
+    p_ah_away_plus05  = p_away
 
     # AH -1 (local gana por 2+)
     p_ah_home_minus1 = float(sum(M[i][j] for i in range(n+1) for j in range(n+1) if i-j >= 2))
@@ -208,30 +236,17 @@ def _compute_ah_prob_from_spread(spread_line: float,
                                   mu: float, lam: float) -> tuple[float, float]:
     """
     Calcula P(home cubre) y P(away cubre) para un spread real ESPN.
-
-    Para spread = -1.5: local gana por 2+
-    Para spread = -0.5: local gana (sin empate)
-    Para spread = +0.5: local gana o empata
-    etc.
-
-    Retorna (prob_home_covers, prob_away_covers).
     """
     M   = _poisson_matrix(mu, lam)
     n   = MAX_GOALS
-    # El spread en ESPN es desde la perspectiva del local:
-    # spread = -1.5 significa local -1.5 (necesita ganar por 2+)
-    # La condición home_score - away_score > -spread
-    threshold = -spread_line  # umbral: diferencia de goles que necesita local
+    threshold = -spread_line
 
     p_home_covers = float(sum(
         M[i][j] for i in range(n+1) for j in range(n+1)
-        if (i - j) > threshold - 0.001   # pequeña tolerancia floating point
+        if (i - j) > threshold - 0.001
     ))
-    # En AH el empate en el spread es push (devuelve), así que:
-    # si threshold es entero, hay que manejar el push
     is_integer_spread = abs(threshold - round(threshold)) < 0.01
     if is_integer_spread:
-        # Push si la diferencia es exactamente threshold — se divide al 50%
         p_push = float(sum(
             M[i][j] for i in range(n+1) for j in range(n+1)
             if abs((i - j) - threshold) < 0.01
@@ -287,7 +302,6 @@ def get_current_season_odds(home_team: str, away_team: str,
     if not odds_cols:
         return None
 
-    # Exacto
     mask   = (historical["home_team_norm"] == h_norm) & (historical["away_team_norm"] == a_norm)
     exact  = historical[mask].sort_values("match_date", ascending=False)
     if not exact.empty:
@@ -296,7 +310,6 @@ def get_current_season_odds(home_team: str, away_team: str,
             result["method"] = "exact_match"
             return result
 
-    # Contextual
     home_home = historical[historical["home_team_norm"] == h_norm]\
         .sort_values("match_date", ascending=False).head(_N_RECENT_CONTEXT)
     away_away = historical[historical["away_team_norm"] == a_norm]\
@@ -340,7 +353,6 @@ def get_current_season_odds(home_team: str, away_team: str,
 # ─── CONSTRUCCIÓN DE CUOTAS ───────────────────────────────────────────────────
 
 def _fair_to_market(prob: float, overround: float = 0.05) -> float:
-    """Cuota fair con overround. Mínimo 1.01."""
     if prob <= 0: return 99.0
     return round(max(1.01, (1 / prob) * (1 - overround)), 3)
 
@@ -365,8 +377,6 @@ def build_odds_dict(home_team: str, away_team: str,
     Nivel 1 — ESPN real (mejor):
         1a. 1X2 → moneyLine convertido a decimal
         1b. Over/Under → overOdds/underOdds sobre espn_total_line
-            Si la línea ESPN ≠ 2.5, adapta la probabilidad del modelo
-            para esa línea específica.
         1c. AH/Spread → spreadOdds sobre espn_spread_line real
 
     Nivel 2 — Football-Data.co.uk (bueno):
@@ -378,7 +388,6 @@ def build_odds_dict(home_team: str, away_team: str,
 
     Retorna (odds_dict, tiene_cuotas_reales_1x2, método).
     """
-    # Base: cuotas derivadas del modelo para TODOS los mercados
     model_odds = {
         mkt: _fair_to_market(market_probs.get(f"prob_{mkt}", 0))
         for mkt in [
@@ -406,7 +415,6 @@ def build_odds_dict(home_team: str, away_team: str,
         if h_odd and a_odd and float(h_odd) > 1.0:
             odds = model_odds.copy()
 
-            # 1a — 1X2
             odds["home_win"] = float(h_odd)
             odds["draw"]     = float(d_odd) if d_odd else model_odds["draw"]
             odds["away_win"] = float(a_odd)
@@ -414,41 +422,35 @@ def build_odds_dict(home_team: str, away_team: str,
             odds["double_x2"] = _double_chance_odds(odds["draw"], float(a_odd))
             odds["double_12"] = _double_chance_odds(float(h_odd), float(a_odd))
 
-            # 1b — Over/Under con línea real
             total_line = fixture_row.get("espn_total_line")
             over_dec   = fixture_row.get("espn_over_odds")
             under_dec  = fixture_row.get("espn_under_odds")
 
             if total_line is not None and over_dec and under_dec:
                 line = float(total_line)
-                # Mapear la línea al mercado más cercano que tenemos
                 line_to_mkt = {0.5: ("over05", "under05"), 1.5: ("over15", "under15"),
                                2.5: ("over25", "under25"), 3.5: ("over35", "under35"),
                                4.5: ("over45", "under45")}
-                # Cuota real para la línea exacta
                 mkt_over, mkt_under = line_to_mkt.get(line, ("over25", "under25"))
                 odds[mkt_over]  = float(over_dec)
                 odds[mkt_under] = float(under_dec)
             elif over_dec and under_dec:
-                # Sin línea explícita, asumir 2.5
                 odds["over25"]  = float(over_dec)
                 odds["under25"] = float(under_dec)
 
-            # 1c — Spread / Asian Handicap real
             spread_line = fixture_row.get("espn_spread_line")
             sh_odds     = fixture_row.get("espn_spread_home_odds")
             sa_odds     = fixture_row.get("espn_spread_away_odds")
 
             if spread_line is not None and sh_odds and sa_odds:
                 sl = float(spread_line)
-                # Mapear spread a mercado AH más cercano
                 if abs(sl - (-0.5)) < 0.3:
                     odds["ah_home_minus05"] = float(sh_odds)
                     odds["ah_away_plus05"]  = float(sa_odds)
                 elif abs(sl - 0.5) < 0.3:
                     odds["ah_home_plus05"]  = float(sh_odds)
                     odds["ah_away_minus05"] = float(sa_odds)
-                elif sl <= -0.9:  # -1 o más
+                elif sl <= -0.9:
                     odds["ah_home_minus1"]  = float(sh_odds)
                     odds["ah_away_minus1"]  = float(sa_odds)
 
@@ -485,39 +487,65 @@ def classify_confidence(edge: float, model_prob: float,
                         odds_method: str,
                         market: str) -> str | None:
     """
-    Clasifica confianza con lógica diferenciada por fuente y tipo de mercado.
+    Clasifica confianza en tres niveles: alta, media, baja.
 
-    Con cuotas reales (ESPN o fd.co.uk): umbrales estándar para todos los mercados.
+    ALTA:  edge >= 8%,  prob >= 62%, n >= 30. Señal fuerte.
+    MEDIA: edge >= 4%,  prob >= 55%, n >= 15. Señal moderada.
+    BAJA:  edge >= 2%,  prob >= 52%, n >= 6.
+           Solo con cuotas reales (nunca model_implied).
+           Solo mercados estándar (_MERCADOS_NIVEL_BAJA).
+
     Con model_implied:
-      - Mercados estándar (1X2, Over/Under 2.5): BLOQUEADOS siempre.
-      - Mercados nicho: umbral elevado (+4pp) y prob mínima 65%.
+      - Mercados estándar: BLOQUEADOS siempre.
+      - Mercados nicho: umbral elevado (+4pp) y prob >= 65%.
     """
     is_real = odds_method in ("espn_live", "exact_match", "contextual_avg", "fd_historical")
 
     if odds_method == "model_implied":
-        # Bloquear mercados estándar completamente
         if market in _MERCADOS_BLOQUEADOS_MODEL_IMPLIED:
             return None
-        # Mercados nicho: umbral elevado
         edge_alta  = _EDGE_NICHO_ALTA
         edge_media = _EDGE_NICHO_MEDIA
         prob_min   = _PROB_NICHO
+        # Sin nivel baja para model_implied
+        if (edge >= edge_alta and model_prob >= prob_min and
+            n_home >= MIN_PARTIDOS_BAJA and n_away >= MIN_PARTIDOS_BAJA):
+            return "alta"
+        if (edge >= edge_media and model_prob >= prob_min and
+            n_home >= MIN_PARTIDOS_BAJA and n_away >= MIN_PARTIDOS_BAJA):
+            return "media"
+        return None
+
     elif is_real:
         edge_alta  = UMBRAL_EDGE_ALTA
         edge_media = UMBRAL_EDGE_MEDIA
-        prob_min   = UMBRAL_PROB_MEDIA
+        prob_alta  = UMBRAL_PROB_ALTA
+        prob_media = UMBRAL_PROB_MEDIA
     else:
+        # ESPN sin cuotas reales (casos edge)
         edge_alta  = UMBRAL_EDGE_ALTA_ESPN
         edge_media = UMBRAL_EDGE_MEDIA_ESPN
-        prob_min   = UMBRAL_PROB_MEDIA
+        prob_alta  = UMBRAL_PROB_ALTA
+        prob_media = UMBRAL_PROB_MEDIA
 
-    if (edge >= edge_alta and model_prob >= UMBRAL_PROB_ALTA and
+    # ── ALTA ─────────────────────────────────────────────────────────────
+    if (edge >= edge_alta and model_prob >= prob_alta and
         n_home >= MIN_PARTIDOS_ALTA and n_away >= MIN_PARTIDOS_ALTA):
         return "alta"
 
-    if (edge >= edge_media and model_prob >= prob_min and
+    # ── MEDIA ─────────────────────────────────────────────────────────────
+    if (edge >= edge_media and model_prob >= prob_media and
         n_home >= MIN_PARTIDOS_MEDIA and n_away >= MIN_PARTIDOS_MEDIA):
         return "media"
+
+    # ── BAJA — solo con cuotas reales y mercados estándar ─────────────────
+    if (is_real and
+        market in _MERCADOS_NIVEL_BAJA and
+        edge >= UMBRAL_EDGE_BAJA and
+        model_prob >= UMBRAL_PROB_BAJA and
+        n_home >= MIN_PARTIDOS_BAJA and
+        n_away >= MIN_PARTIDOS_BAJA):
+        return "baja"
 
     return None
 
@@ -531,12 +559,20 @@ def calculate_edge(model_prob: float, decimal_odds: float) -> float:
 
 
 def kelly_fraction(model_prob: float, decimal_odds: float,
-                   fraction: float = KELLY_FRACCION) -> float:
+                   fraction: float = KELLY_FRACCION,
+                   confidence: str = "media") -> float:
+    """
+    Calcula el Kelly criterion fraccionado.
+    El nivel 'baja' usa el 50% de la fracción normal para reflejar
+    la menor certeza estadística.
+    """
     if decimal_odds <= 1.0 or model_prob <= 0:
         return 0.0
     b     = decimal_odds - 1
     kelly = (model_prob * b - (1 - model_prob)) / b
-    return round(max(kelly * fraction, 0.0) * 100, 2)
+    # Reducir fracción para nivel baja
+    effective_fraction = fraction * 0.5 if confidence == "baja" else fraction
+    return round(max(kelly * effective_fraction, 0.0) * 100, 2)
 
 
 def get_model_prob_for_market(market: str, market_probs: dict) -> float:
@@ -670,21 +706,16 @@ def analyze_fixture(fixture_row: pd.Series, predictions: dict,
     n_home = int(fixture_row.get("n_home_matches", 0))
     n_away = int(fixture_row.get("n_away_matches", 0))
 
-    # Goles esperados de Dixon-Coles
     mu  = predictions.get("dc_exp_home_goals", 1.4)
     lam = predictions.get("dc_exp_away_goals", 1.1)
 
-    # Probabilidades Poisson para todos los mercados
     market_probs = compute_all_market_probs(mu, lam)
 
-    # Sobreescribir mercados principales con el blend DC+XGBoost
-    # (más preciso que Poisson puro para 1X2, BTTS, Over/Under 2.5)
     for blend_key in ["prob_home_win", "prob_draw", "prob_away_win",
                        "prob_btts", "prob_over25", "prob_under25"]:
         if blend_key in predictions:
             market_probs[blend_key] = predictions[blend_key]
 
-    # Si hay spread real ESPN, recalcular probs AH con ese spread
     spread_line = fixture_row.get("espn_spread_line")
     if spread_line is not None:
         p_h_covers, p_a_covers = _compute_ah_prob_from_spread(
@@ -701,7 +732,6 @@ def analyze_fixture(fixture_row: pd.Series, predictions: dict,
             market_probs["prob_ah_home_minus1"]  = p_h_covers
             market_probs["prob_ah_away_minus1"]  = p_a_covers
 
-    # Construir cuotas
     reference_odds, odds_are_real, odds_method = build_odds_dict(
         home, away, historical, fixture_row, market_probs
     )
@@ -725,7 +755,8 @@ def analyze_fixture(fixture_row: pd.Series, predictions: dict,
         if confidence is None:
             continue
 
-        kelly       = kelly_fraction(model_prob, odds)
+        # Kelly reducido al 50% para nivel baja
+        kelly       = kelly_fraction(model_prob, odds, confidence=confidence)
         market_type = market.split("_")[0] if "_" in market else market
         feats       = top_features.get(market_type, [])
         explanation = build_explanation(
@@ -757,7 +788,7 @@ def analyze_fixture(fixture_row: pd.Series, predictions: dict,
         })
 
     bets.sort(key=lambda x: (
-        {"alta": 0, "media": 1}.get(x["confidence"], 9),
+        {"alta": 0, "media": 1, "baja": 2}.get(x["confidence"], 9),
         -x["edge_pct"]
     ))
     return bets
@@ -792,11 +823,12 @@ def detect_all_value_bets(features_df: pd.DataFrame,
 
 def summarize_bets(bets_df: pd.DataFrame) -> dict:
     if bets_df.empty:
-        return {"total": 0, "alta": 0, "media": 0}
+        return {"total": 0, "alta": 0, "media": 0, "baja": 0}
     result = {
         "total":    len(bets_df),
         "alta":     len(bets_df[bets_df["confidence"] == "alta"]),
         "media":    len(bets_df[bets_df["confidence"] == "media"]),
+        "baja":     len(bets_df[bets_df["confidence"] == "baja"]),
         "edge_max": round(bets_df["edge_pct"].max(), 2),
         "edge_avg": round(bets_df["edge_pct"].mean(), 2),
     }

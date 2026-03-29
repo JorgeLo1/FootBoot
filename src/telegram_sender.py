@@ -1,7 +1,14 @@
 """
-telegram_sender.py — v5
+telegram_sender.py — v6
 Formatea y envía el reporte diario a Telegram.
 Soporte completo para mercados expandidos — agrupados por partido y categoría.
+
+CAMBIOS v6:
+  - Sección 🔵 BAJA CONFIANZA añadida al reporte diario.
+  - format_message filtra los 3 niveles y los renderiza en orden alta→media→baja.
+  - summarize_bets y model_stats muestran stats del nivel baja si están disponibles.
+  - El nivel baja incluye una advertencia inline para que el usuario sepa
+    que son señales débiles y debe gestionar el tamaño de apuesta con cuidado.
 """
 
 import sys
@@ -66,11 +73,11 @@ GROUP_LABELS = {
 
 # Etiqueta de fuente de cuota para el usuario
 _ODDS_SOURCE_LABEL = {
-    "espn_live":      "",                      # cuota real — no necesita nota
-    "exact_match":    "",                      # cuota real — no necesita nota
-    "contextual_avg": " _(hist.)_",            # real pero no del partido exacto
+    "espn_live":      "",
+    "exact_match":    "",
+    "contextual_avg": " _(hist.)_",
     "fd_historical":  " _(hist.)_",
-    "model_implied":  " _(est.)_",             # derivada del modelo
+    "model_implied":  " _(est.)_",
 }
 
 
@@ -90,12 +97,10 @@ def format_date_es(d: date) -> str:
     return f"{dia_es} {d.day} {mes_es}"
 
 
-def _render_bet_line(bet: pd.Series) -> str:
+def _render_bet_line(bet: pd.Series, is_baja: bool = False) -> str:
     """
     Renderiza una apuesta en una sola línea compacta + línea de detalle.
-    Formato:
-      📌 *Mercado*  Prob: 63.2%  Cuota: 1.85 _(hist.)_  Edge: +8.4%
-         Kelly: 1.2% bankroll | explicación
+    El nivel baja incluye una nota de gestión de riesgo.
     """
     source_tag = _ODDS_SOURCE_LABEL.get(bet.get("odds_source", ""), " _(est.)_")
 
@@ -108,13 +113,15 @@ def _render_bet_line(bet: pd.Series) -> str:
     line2_parts = [f"Kelly `{bet['kelly_pct']}%`"]
     if bet.get("explanation"):
         line2_parts.append(bet["explanation"])
+    if is_baja:
+        line2_parts.append("señal débil — stake reducido")
     line2 = "     " + " | ".join(line2_parts)
 
     return f"{line1}\n{line2}"
 
 
 def _group_bets_by_match(bets_df: pd.DataFrame) -> list[dict]:
-    """Agrupa apuestas por partido manteniendo el orden alta → media."""
+    """Agrupa apuestas por partido manteniendo el orden alta → media → baja."""
     seen   = {}
     result = []
     for _, bet in bets_df.iterrows():
@@ -133,7 +140,7 @@ def _group_bets_by_match(bets_df: pd.DataFrame) -> list[dict]:
     return result
 
 
-def _render_match_block(match: dict) -> list[str]:
+def _render_match_block(match: dict, is_baja: bool = False) -> list[str]:
     """
     Bloque de un partido con encabezado + apuestas agrupadas por categoría.
     """
@@ -149,7 +156,6 @@ def _render_match_block(match: dict) -> list[str]:
         "",
     ]
 
-    # Agrupar apuestas por categoría
     by_group: dict[str, list] = {}
     for bet in match["bets"]:
         placed = False
@@ -169,7 +175,7 @@ def _render_match_block(match: dict) -> list[str]:
         label = GROUP_LABELS.get(group, group.title())
         lines.append(f"_{emoji} {label}_")
         for bet in group_bets:
-            lines.append(_render_bet_line(pd.Series(bet)))
+            lines.append(_render_bet_line(pd.Series(bet), is_baja=is_baja))
         lines.append("")
 
     return lines
@@ -182,6 +188,7 @@ def format_message(bets_df: pd.DataFrame, model_stats: dict = None) -> str:
 
     alta  = bets_df[bets_df["confidence"] == "alta"]  if not bets_df.empty else pd.DataFrame()
     media = bets_df[bets_df["confidence"] == "media"] if not bets_df.empty else pd.DataFrame()
+    baja  = bets_df[bets_df["confidence"] == "baja"]  if not bets_df.empty else pd.DataFrame()
 
     # Contar cuántas son con cuotas reales
     n_real = 0
@@ -199,6 +206,7 @@ def format_message(bets_df: pd.DataFrame, model_stats: dict = None) -> str:
         "",
     ]
 
+    # ── ALTA ─────────────────────────────────────────────────────────────
     if not alta.empty:
         lines += ["🟢 *ALTA CONFIANZA*", "─" * 28, ""]
         for match in _group_bets_by_match(alta):
@@ -206,10 +214,24 @@ def format_message(bets_df: pd.DataFrame, model_stats: dict = None) -> str:
             lines.append("· · ·")
         lines.append("")
 
+    # ── MEDIA ─────────────────────────────────────────────────────────────
     if not media.empty:
         lines += ["🟡 *MEDIA CONFIANZA*", "─" * 28, ""]
         for match in _group_bets_by_match(media):
             lines += _render_match_block(match)
+            lines.append("· · ·")
+        lines.append("")
+
+    # ── BAJA ──────────────────────────────────────────────────────────────
+    if not baja.empty:
+        lines += [
+            "🔵 *BAJA CONFIANZA*",
+            "_Edge reducido — señales exploratorias_",
+            "─" * 28,
+            "",
+        ]
+        for match in _group_bets_by_match(baja):
+            lines += _render_match_block(match, is_baja=True)
             lines.append("· · ·")
         lines.append("")
 
@@ -222,6 +244,7 @@ def format_message(bets_df: pd.DataFrame, model_stats: dict = None) -> str:
 
     lines.append("─" * 28)
 
+    # ── Estadísticas del modelo ───────────────────────────────────────────
     if model_stats and model_stats.get("total", 0) > 10:
         tasa = model_stats.get("tasa_pct", 0)
         roi  = model_stats.get("roi_pct",  0)
@@ -240,7 +263,11 @@ def format_message(bets_df: pd.DataFrame, model_stats: dict = None) -> str:
                 f"  🟡 Media: `{model_stats['tasa_media_pct']}%` · "
                 f"ROI `{model_stats.get('roi_media_pct', 0):+.1f}%`"
             )
-        # Top mercados si están disponibles
+        if "tasa_baja_pct" in model_stats:
+            lines.append(
+                f"  🔵 Baja: `{model_stats['tasa_baja_pct']}%` · "
+                f"ROI `{model_stats.get('roi_baja_pct', 0):+.1f}%`"
+            )
         top_mkts = model_stats.get("top_mercados")
         if top_mkts:
             mkt_str = " · ".join(f"{m}(`{v}`)" for m, v in list(top_mkts.items())[:3])
@@ -261,7 +288,6 @@ def send_telegram(message: str) -> bool:
         return False
 
     url    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    # Telegram límite: 4096 chars por mensaje
     chunks = [message[i:i+4000] for i in range(0, len(message), 4000)]
     success = True
     for chunk in chunks:
