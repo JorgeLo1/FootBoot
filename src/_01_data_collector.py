@@ -31,6 +31,7 @@ from pathlib import Path
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import warnings
+import math
 
 warnings.filterwarnings("ignore", category=UserWarning, module="statsbombpy")
 
@@ -630,6 +631,144 @@ def run():
         "elo":             elo,
     }
 
+def compute_elo_espn(
+    historical: pd.DataFrame = None,
+    k_base: float = 20.0,
+    k_new: float = 40.0,
+    new_team_threshold: int = 30,
+    initial_elo: float = 1500.0,
+    home_advantage: float = 65.0,
+    save: bool = True,
+) -> pd.DataFrame:
+    """
+    Calcula ratings ELO para todos los equipos del histórico ESPN.
+ 
+    Parámetros
+    ----------
+    historical        : DataFrame del histórico ESPN (de load_espn_historical).
+                        Si es None, lo carga automáticamente.
+    k_base            : Factor K estándar (equipos con > new_team_threshold partidos).
+    k_new             : Factor K elevado para equipos nuevos (primeros partidos).
+    new_team_threshold: Partidos necesarios para pasar de K_new a K_base.
+    initial_elo       : Rating de entrada para equipos sin historial.
+    home_advantage    : Ventaja de local en puntos Elo (≈ 65 estándar fútbol).
+    save              : Si True, guarda en data/raw/elo_espn.csv.
+ 
+    Retorna
+    -------
+    DataFrame con columnas: Club, Elo, n_partidos, league_name
+    Compatible con load_elo() de _02_feature_builder.py.
+    """
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+ 
+    if historical is None:
+        from src._01_data_collector import load_espn_historical
+        historical = load_espn_historical()
+ 
+    if historical.empty:
+        import logging
+        logging.getLogger(__name__).warning(
+            "compute_elo_espn: histórico vacío — sin datos para calcular ELO."
+        )
+        return pd.DataFrame(columns=["Club", "Elo", "n_partidos", "league_name"])
+ 
+    # Asegurar orden cronológico
+    hist = historical.copy()
+    hist["match_date"] = pd.to_datetime(hist["match_date"], errors="coerce")
+    hist = hist.dropna(subset=["match_date", "home_goals", "away_goals"])
+    hist = hist.sort_values("match_date").reset_index(drop=True)
+ 
+    # Estado del motor ELO
+    ratings: dict[str, float] = {}
+    games_played: dict[str, int] = {}
+    last_league: dict[str, str] = {}
+ 
+    def _get_rating(team: str) -> float:
+        return ratings.get(team, initial_elo)
+ 
+    def _get_k(team: str) -> float:
+        n = games_played.get(team, 0)
+        return k_new if n < new_team_threshold else k_base
+ 
+    def _margin_factor(goal_diff: int) -> float:
+        """
+        Multiplicador logarítmico para la diferencia de goles.
+        Fórmula FiveThirtyEight: ln(|gd| + 1) / (coef autocorrelación)
+        Simplificada: log2(|gd| + 1.5) — suave, sin explotar.
+        """
+        return math.log(abs(goal_diff) + 1.5, 2)
+ 
+    def _expected(ra: float, rb: float) -> float:
+        return 1.0 / (1.0 + 10.0 ** ((rb - ra) / 400.0))
+ 
+    # Iterar partidos cronológicamente
+    for _, row in hist.iterrows():
+        home = str(row.get("home_team", "")).strip()
+        away = str(row.get("away_team", "")).strip()
+        if not home or not away:
+            continue
+ 
+        try:
+            hg = int(row["home_goals"])
+            ag = int(row["away_goals"])
+        except (ValueError, TypeError):
+            continue
+ 
+        league = str(row.get("league_name", ""))
+        last_league[home] = league
+        last_league[away] = league
+ 
+        ra = _get_rating(home) + home_advantage   # local con ventaja
+        rb = _get_rating(away)
+ 
+        # Resultado real: 1 local, 0.5 empate, 0 visitante
+        if hg > ag:
+            s_home, s_away = 1.0, 0.0
+        elif hg == ag:
+            s_home, s_away = 0.5, 0.5
+        else:
+            s_home, s_away = 0.0, 1.0
+ 
+        e_home = _expected(ra, rb)
+        e_away = 1.0 - e_home
+ 
+        gd = abs(hg - ag)
+        mf = _margin_factor(gd)
+ 
+        k_home = _get_k(home)
+        k_away = _get_k(away)
+ 
+        # Actualizar ratings (sin la ventaja de local — es solo para cálculo)
+        ratings[home] = _get_rating(home) + k_home * mf * (s_home - e_home)
+        ratings[away] = _get_rating(away) + k_away * mf * (s_away - e_away)
+ 
+        games_played[home] = games_played.get(home, 0) + 1
+        games_played[away] = games_played.get(away, 0) + 1
+ 
+    # Construir DataFrame final
+    records = []
+    for team, elo in ratings.items():
+        records.append({
+            "Club":         team,
+            "Elo":          round(elo, 1),
+            "n_partidos":   games_played.get(team, 0),
+            "league_name":  last_league.get(team, ""),
+        })
+ 
+    df_elo = pd.DataFrame(records).sort_values("Elo", ascending=False).reset_index(drop=True)
+ 
+    if save:
+        from config.settings import DATA_RAW
+        path = Path(DATA_RAW) / "elo_espn.csv"
+        df_elo.to_csv(path, index=False)
+        import logging
+        logging.getLogger(__name__).info(
+            f"ELO ESPN calculado: {len(df_elo)} equipos → {path}"
+        )
+ 
+    return df_elo
 
 if __name__ == "__main__":
     run()

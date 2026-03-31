@@ -7,6 +7,10 @@ FIXES v3:
     para que Open-Meteo reciba coordenadas reales en vez del fallback Londres.
   - Open-Meteo: si la fecha es futura (> 16 días), usa climatología en vez
     de pronóstico (evita el 400 Bad Request).
+
+FIXES v4:
+  - Open-Meteo 400 Bad Request para hoy/mañana: usar forecast_days sin
+    start_date/end_date cuando days_ahead <= 1; indexar el array por days_ahead.
 """
 
 import os
@@ -253,10 +257,12 @@ def get_weather_for_fixture(home_team: str, match_datetime) -> dict:
     """
     Obtiene pronóstico del clima para un partido usando Open-Meteo (sin API key).
 
-    FIX: si el equipo no está en ESTADIOS, usa el fallback pero loguea
-    solo una vez por equipo (no spam). Si la fecha excede el horizonte de
-    pronóstico (>16 días), devuelve valores neutros sin llamar a la API
-    (evita el 400 Bad Request).
+    FIX v4:
+    - Si la fecha excede el horizonte (>16 días) devuelve valores neutros (no llama API).
+    - Para hoy/mañana (days_ahead <= 1) usa forecast_days sin start/end_date,
+      evitando el 400 Bad Request que Open-Meteo lanza cuando start_date == hoy
+      en timezones UTC-5 (Colombia, etc.). Se selecciona el índice correcto del array.
+    - Para fechas 2-16 días adelante sigue usando start_date/end_date.
     """
     from config.settings import OPENMETEO_URL
 
@@ -291,24 +297,38 @@ def get_weather_for_fixture(home_team: str, match_datetime) -> dict:
                 "rain_flag": 0, "wind_flag": 0}
 
     try:
-        r = requests.get(
-            OPENMETEO_URL,
-            params={
+        # Open-Meteo da 400 Bad Request cuando start_date == hoy en algunos
+        # timezones. Para partidos de hoy (days_ahead == 0) o mañana (== 1)
+        # usamos forecast_days sin start/end_date y seleccionamos el día correcto.
+        # Para fechas futuras (2-16 días) sí usamos start_date/end_date.
+        if days_ahead <= 1:
+            params: dict = {
                 "latitude":      lat,
                 "longitude":     lon,
                 "timezone":      "auto",
                 "daily":         "precipitation_sum,windspeed_10m_max,temperature_2m_max",
-                "forecast_days": 3,
+                "forecast_days": max(2, days_ahead + 1),
+            }
+        else:
+            params = {
+                "latitude":      lat,
+                "longitude":     lon,
+                "timezone":      "auto",
+                "daily":         "precipitation_sum,windspeed_10m_max,temperature_2m_max",
+                "forecast_days": days_ahead + 1,
                 "start_date":    ds,
                 "end_date":      ds,
-            },
-            timeout=8,
-        )
+            }
+
+        r = requests.get(OPENMETEO_URL, params=params, timeout=8)
         r.raise_for_status()
-        d    = r.json().get("daily", {})
-        prec = (d.get("precipitation_sum") or [0])[0] or 0
-        wind = (d.get("windspeed_10m_max") or [10])[0] or 10
-        temp = (d.get("temperature_2m_max") or [15])[0] or 15
+        d   = r.json().get("daily", {})
+        # Cuando usamos forecast_days sin start_date, el array arranca desde hoy.
+        # El día que nos interesa está en el índice days_ahead.
+        idx  = days_ahead if days_ahead <= 1 else 0
+        prec = (d.get("precipitation_sum") or [0] * (idx + 1))[idx] or 0
+        wind = (d.get("windspeed_10m_max") or [10] * (idx + 1))[idx] or 10
+        temp = (d.get("temperature_2m_max") or [15] * (idx + 1))[idx] or 15
         return {
             "temp_max":      float(temp),
             "precipitation": float(prec),

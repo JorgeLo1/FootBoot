@@ -97,6 +97,7 @@ def run_pipeline():
             download_statsbomb_data,
             download_elo_ratings,
             download_espn_historical,
+            compute_elo_espn,
         )
         from src.espn_collector import ESPNClient
 
@@ -124,6 +125,8 @@ def run_pipeline():
             log.info("Descargando histórico ESPN para ligas adicionales...")
             try:
                 download_espn_historical(fetch_plays=False, max_per_team=30)
+                log.info("Recalculando Ratings Elo desde ESPN...")
+                compute_elo_espn()
             except Exception as e:
                 log.warning(f"ESPN histórico falló (no crítico): {e}")
 

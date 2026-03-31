@@ -478,7 +478,7 @@ class FootbotEnsemble:
         self.fitted              = False
         self.blend_weights: dict[str, float] = {}
 
-    def _get_xgb(self):
+    def _get_xgb(self, scale_pos_weight: float = 1.0):
         return XGBClassifier(
             n_estimators=XGB_N_ESTIMATORS,
             max_depth=XGB_MAX_DEPTH,
@@ -486,6 +486,7 @@ class FootbotEnsemble:
             subsample=0.8,
             colsample_bytree=0.8,
             eval_metric="logloss",
+            scale_pos_weight=scale_pos_weight,
             random_state=RANDOM_SEED,
             n_jobs=-1,
             verbosity=0,
@@ -572,12 +573,21 @@ class FootbotEnsemble:
             X_train, X_val = X[:split], X[split:]
             y_train, y_val = y[:split], y[split:]
 
+            # Calcular scale_pos_weight para balancear clases minoritarias.
+            # Evita que XGBoost prediga siempre la clase mayoritaria (draw ~27%,
+            # away_win ~28%), que produce accuracy alta con ROI 0.0%.
+            n_neg = int((y_train == 0).sum())
+            n_pos = int((y_train == 1).sum())
+            if n_pos > 0:
+                spw = round(n_neg / n_pos, 3)
+            else:
+                spw = 1.0
             log.info(
                 f"Entrenando XGBoost [{market}]: "
-                f"{int(y.sum())} positivos de {len(y)}"
+                f"{n_pos} positivos / {n_neg} negativos → scale_pos_weight={spw}"
             )
 
-            xgb = self._get_xgb()
+            xgb = self._get_xgb(scale_pos_weight=spw)
             xgb.fit(X_train, y_train,
                     eval_set=[(X_val, y_val)],
                     verbose=False)

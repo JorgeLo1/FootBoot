@@ -10,8 +10,8 @@ Destino final: Oracle Cloud ARM (Always Free).
 - Modelo: Dixon-Coles por liga + XGBoost ensemble con calibración isotónica
 - Datos históricos: ESPN API (sin key) — ligas LATAM y copas
 - Fixtures del día: football-data.org (7 ligas EU) + ESPN API
-- ELO ratings: ClubElo.com (sin key) — no cubre equipos LATAM (devuelve 0.0)
-- Clima: Open-Meteo (sin key) — bug activo para fechas de hoy (400 Bad Request)
+- ELO ratings: ClubElo.com (sin key) — solo EU + **ELO propio ESPN** ✅ (`compute_elo_espn` en `_01_data_collector.py`) — ambas fuentes fusionadas en `load_elo()` v5; `elo_diff` funcional para todos los equipos LATAM
+- Clima: Open-Meteo (sin key) — `utils.py` v4 ✅
 - Base de datos: Supabase (✅ conectado — `supabase==2.3.0`, tablas creadas con DDL v2)
 - Notificaciones: Telegram Bot API (✅ conectado — token y chat_id configurados)
 
@@ -24,11 +24,11 @@ footbot/
 ├── config/
 │   └── settings.py              # Constantes globales, umbrales, API keys
 ├── src/
-│   ├── _01_data_collector.py    # Descarga fixtures, histórico, ELO
-│   ├── _02_feature_builder.py   # Features por partido (forma, H2H, xG, clima)
-│   ├── _03_model_engine.py      # Dixon-Coles + XGBoost + blend weights
+│   ├── _01_data_collector.py    # Descarga fixtures, histórico, ELO (v4 — compute_elo_espn)
+│   ├── _02_feature_builder.py   # Features por partido (forma, H2H, xG, clima) — v5: load_elo fusiona ClubElo + ESPN
+│   ├── _03_model_engine.py      # Dixon-Coles + XGBoost + blend weights — v7: scale_pos_weight dinámico por mercado
 │   ├── _04_value_detector.py    # Edge%, Kelly, clasificación de confianza
-│   ├── _05_result_updater.py    # Cierre de predicciones con resultado real
+│   ├── _05_result_updater.py    # Cierre de predicciones con resultado real (v2)
 │   ├── espn_collector.py        # Cliente ESPN unificado (v3)
 │   ├── nacional_features.py     # Features para selecciones nacionales
 │   ├── telegram_sender.py       # Formateo y envío de reportes (v6)
@@ -44,11 +44,13 @@ footbot/
 │   ├── test_espn_collector.py
 │   ├── test_feature_builder.py
 │   ├── test_model_engine.py
-│   ├── test_result_updater.py
+│   ├── test_result_updater.py   # v2 — cubre todos los mercados expandidos
 │   ├── test_telegram_sender.py
 │   └── test_value_detector.py
 ├── data/
 │   ├── raw/                     # CSVs ESPN, ELO, fixtures del día
+│   │   ├── elo_ratings.csv      # ClubElo (solo equipos EU)
+│   │   └── elo_espn.csv         # ELO propio calculado desde histórico ESPN ✅
 │   └── processed/               # Features y datasets de entrenamiento
 └── models/                      # Modelos .pkl versionados por fecha
 ```
@@ -63,21 +65,35 @@ footbot/
 - Cuotas ESPN en tiempo real: 3/3 partidos con DraftKings
 - Dixon-Coles entrenado por liga (Liga BetPlay, Brasileirão, Champions, Liga MX, Liga Profesional Argentina)
 - Fuzzy matching de nombres (rapidfuzz) resuelve correctamente equipos colombianos
-- Histórico ESPN: 4226 partidos de 7 ligas (2024–2026)
+- **Histórico ESPN: 4236 partidos** de 7 ligas (2024–2026) — verificado con `diag1.py` el 2026-03-31
 - Blend weights optimizados por mercado (dc_weight=0.70 para todos)
 - Fix league_id lookup: ligas ESPN resuelven correctamente (v6)
 - Sistema de 3 niveles de confianza: alta, media, baja (v6)
 - Suite de tests unitarios completa (pytest, 7 módulos)
-- DDL Supabase generado y ejecutado (3 tablas con bug `'baja'` corregido — DDL v2)
+- DDL Supabase generado y ejecutado (tablas con DDL v2 — `'baja'` en CHECK, vistas `roi_por_mercado` y `resumen_diario`)
 - Supabase conectado: `supabase==2.3.0`, insert/delete verificados (tabla `predicciones`)
 - Telegram conectado: token + chat_id reales, mensaje de prueba enviado OK
 - Test de integración `test_conexiones.py`: 4/4 tests OK
+- **`evaluate_bet` completo** ✅ — cubre todos los mercados: 1X2, doble oportunidad, over/under 0.5–4.5, BTTS, por equipo, goles exactos, combinadas, Asian Handicap ±0.5 y -1
+- **`compute_model_stats` con desglose por nivel y mercado** ✅ — ROI tracking funcional para alta/media/baja
+- **`compute_elo_espn`** ✅ — ELO propio calculado desde histórico ESPN con factor K dinámico y margin factor logarítmico; guarda `data/raw/elo_espn.csv`
+- **`load_elo()` fusionada** ✅ — `_02_feature_builder.load_elo()` v5 lee y fusiona `elo_ratings.csv` (ClubElo, EU) + `elo_espn.csv` (ESPN, LATAM); prioriza ESPN en caso de equipo duplicado; `elo_diff` ya no es 0.0 para equipos LATAM
+- **`scale_pos_weight` dinámico en XGBoost** ✅ — `_03_model_engine.py` v7 calcula `neg/pos` por mercado antes de entrenar cada clasificador; `draw` (~2.7×) y `away_win` (~2.6×) dejan de predecir clase mayoritaria
+- **Reentrenamiento v7 ejecutado** ✅ — modelos reentrenados el 2026-03-31 con dataset v6 (4236 partidos, O(n) cache); `dc_exp_home_goals` y `dc_exp_away_goals` devuelven valores reales por equipo (ej: Tolima 1.638 vs Águilas 0.639)
+- **`detect_all_value_bets`** ✅ — nombre real de la función de producción en `_04_value_detector.py` (no `detect_value_bets`); funciones públicas del módulo: `analyze_fixture`, `build_explanation`, `build_odds_dict`, `calculate_edge`, `classify_confidence`, `compute_all_market_probs`, `detect_all_value_bets`, `get_current_season_odds`, `get_model_prob_for_market`, `kelly_fraction`, `normalize_team_name`, `summarize_bets`
+- **Claves BTTS en `market_probs`** ✅ — confirmadas: `prob_btts`, `prob_btts_no`, `prob_home_and_btts`, `prob_draw_and_btts`, `prob_away_and_btts` (NO existe `prob_btts_si`)
+- **`get_results_espn`** ✅ — fuente de resultados ESPN integrada en `_05_result_updater.py` como fallback a fd.org
+- **DDL v2 completo** ✅ — columnas `home_goals`/`away_goals` en `predicciones`, índice por mercado, vistas `roi_por_mercado` y `resumen_diario`
 
 ### Pendiente ⚠️
-- **Open-Meteo:** da 400 Bad Request para fechas de hoy (bug en cálculo de días adelante)
+- ~~**Open-Meteo:**~~ ✅ **RESUELTO** — `utils.py` v4: `forecast_days` sin `start/end_date` para `days_ahead <= 1`; índice correcto del array de respuesta
 - **Football-Data.co.uk:** no descargado (ESPN_ONLY=true en .env)
-- **ELO:** ClubElo no cubre equipos LATAM — devuelve 0.0 para col.1
-- **`_05_result_updater.py`:** faltan evaluadores para over15, under15, over45, home_over05, home_over15, away_over05, away_over15, exact_0..4plus, combinadas (home_and_btts, etc.) y AH — ROI stats incompletas
+- ~~**ELO LATAM en pipeline:**~~ ✅ **RESUELTO** — `load_elo()` v5 fusiona ClubElo + `elo_espn.csv`; `elo_diff` funcional en LATAM
+- ~~**`build_training_dataset` O(n²):**~~ ✅ **RESUELTO** — `_02_feature_builder.py` v6: `_precompute_rolling_cache` pre-computa rolling stats O(n); ~90s → ~5s con 4226 partidos
+- **Copa Libertadores / Sudamericana:** < 200 partidos → sin DC propio; modelo global no converge (> 80 equipos)
+- ~~**Distribución de clases XGBoost:**~~ ✅ **RESUELTO** — `scale_pos_weight` dinámico por mercado en v7; reentrenamiento ejecutado 2026-03-31 con 4236 partidos ✅
+- **Métricas XGBoost post-fix:** reentrenamiento ejecutado pero evaluación formal pendiente — `draw`/`away_win` con ROI 0.0% son métricas pre-fix, no reflejan el estado actual del modelo
+- **Bug `btts_si` en scripts de diagnóstico:** `diag2.py` busca `prob_btts_si` pero la clave real en `market_probs` es `prob_btts` → retorna 0% con cuota fallback 99.0. **Solo afecta diag2.py**, no producción (`detect_all_value_bets` usa `get_model_prob_for_market` internamente). Fix: cambiar `'btts_si'` → `'btts'` en el loop de mercados de `diag2.py`
 
 ---
 
@@ -85,9 +101,9 @@ footbot/
 
 | Liga | Slug | league_id | Partidos |
 |------|------|-----------|---------|
-| Liga BetPlay | col.1 | 501 | 1006 |
-| Liga Profesional Argentina | arg.1 | 502 | 1050 |
-| Brasileirão Serie A | bra.1 | 503 | 804 |
+| Liga BetPlay | col.1 | 501 | 1014 |
+| Liga Profesional Argentina | arg.1 | 502 | 1051 |
+| Brasileirão Serie A | bra.1 | 503 | 805 |
 | Copa Libertadores | conmebol.libertadores | 511 | 256 |
 | Copa Sudamericana | conmebol.sudamericana | 512 | 165 |
 | Champions League | uefa.champions | 514 | 328 |
@@ -97,7 +113,7 @@ footbot/
 
 ---
 
-## Modelos entrenados (última versión: 20260328)
+## Modelos entrenados (última versión: 20260331)
 
 ### Dixon-Coles por liga
 Entrenado con L-BFGS-B (reemplazó SLSQP — más rápido con 100+ equipos).
@@ -128,13 +144,139 @@ Entrenado con L-BFGS-B (reemplazó SLSQP — más rápido con 100+ equipos).
 | btts | 53.8% | -3.6% | 0.675 |
 | over25 | 56.3% | +7.1% | 0.700 |
 
-> **Nota:** `draw` y `away_win` con accuracy alta y ROI 0.0% sugieren posible
-> clase mayoritaria o ausencia de edge real en esos mercados. Revisar distribución
-> de clases antes de confiar en estas métricas.
+> **Nota:** Métricas pre-fix (reentrenamiento con `scale_pos_weight` dinámico v7 ejecutado el 2026-03-31 con dataset v6 — 4236 partidos). Se espera que `draw` y `away_win` muestren ROI real en lugar de 0.0% pero las métricas de validación post-fix aún no han sido registradas. Pendiente correr evaluación formal.
 
 ---
 
-## Bug crítico corregido: league_id lookup en DixonColesEnsemble (v6)
+---
+
+## Fix: `load_elo()` fusionada con ELO ESPN (`_02_feature_builder.py` v5)
+
+**Problema:** `load_elo()` solo leía `elo_ratings.csv` (ClubElo), que no cubre
+equipos LATAM. Resultado: `elo_diff = 0.0` para todos los partidos de Liga BetPlay,
+Brasileirão, Liga Profesional Argentina y Liga MX.
+
+**Fix (`_02_feature_builder.py` v5):**
+```python
+def load_elo() -> pd.DataFrame:
+    frames = []
+    # Fuente 1: ClubElo (EU)
+    path_clubelo = os.path.join(DATA_RAW, "elo_ratings.csv")
+    if os.path.exists(path_clubelo):
+        df_clubelo = pd.read_csv(path_clubelo)
+        df_clubelo["team_norm"] = df_clubelo["Club"].apply(normalize_team_name)
+        df_clubelo["_source"] = "clubelo"
+        frames.append(df_clubelo)
+
+    # Fuente 2: ELO propio ESPN (LATAM)
+    path_espn = os.path.join(DATA_RAW, "elo_espn.csv")
+    if os.path.exists(path_espn):
+        df_espn = pd.read_csv(path_espn)
+        df_espn["team_norm"] = df_espn["Club"].apply(normalize_team_name)
+        df_espn["_source"] = "espn"
+        frames.append(df_espn)
+
+    combined = pd.concat(frames, ignore_index=True)
+    # Si equipo aparece en ambas fuentes, gana ESPN (más reciente, más LATAM)
+    combined["_source_order"] = combined["_source"].map({"clubelo": 0, "espn": 1})
+    combined = combined.sort_values("_source_order")
+    combined = combined.drop_duplicates(subset="team_norm", keep="last")
+    return combined.drop(columns=["_source", "_source_order"])
+```
+
+**Prerequisito:** `elo_espn.csv` debe existir en `data/raw/`. Si no existe, ejecutar:
+```powershell
+python -c "from src._01_data_collector import compute_elo_espn; compute_elo_espn()"
+```
+
+**Resultado post-fix:** `elo_diff` tiene valores reales para equipos LATAM.
+Ejemplo: Millonarios (1620) vs Nacional (1580) → `elo_diff = +40` en lugar de `0.0`.
+
+---
+
+## Fix: Open-Meteo 400 Bad Request para hoy/mañana (`utils.py` v4)
+
+**Problema:** `start_date == today` provoca 400 Bad Request en Open-Meteo cuando el timezone
+es UTC-5 (Colombia). Afectaba todos los partidos del día y del día siguiente.
+
+**Fix (`utils.py` v4):**
+```python
+if days_ahead <= 1:
+    # Sin start/end_date — Open-Meteo devuelve array desde hoy
+    params = {"forecast_days": max(2, days_ahead + 1), ...}
+else:
+    # Fecha futura: start/end_date sigue funcionando
+    params = {"forecast_days": days_ahead + 1, "start_date": ds, "end_date": ds, ...}
+
+r = requests.get(OPENMETEO_URL, params=params, timeout=8)
+# Seleccionar el día correcto del array
+idx  = days_ahead if days_ahead <= 1 else 0
+prec = (d.get("precipitation_sum") or [0] * (idx + 1))[idx] or 0
+```
+
+**Resultado post-fix:** Clima disponible para partidos de hoy y mañana sin errores 400.
+
+---
+
+## Fix: `build_training_dataset` O(n²) → O(n) (`_02_feature_builder.py` v6)
+
+**Problema:** En cada iteración del loop walk-forward, `compute_team_stats` filtraba
+`historical.iloc[:idx]` desde cero — O(n) por partido, O(n²) total. Con 4226 partidos: ~90s.
+
+**Fix (`_02_feature_builder.py` v6):** Nueva función `_precompute_rolling_cache` que
+recorre el histórico **una sola vez por equipo** y guarda stats en:
+`dict[(team_norm, is_home, match_idx)] → stats`
+
+El loop principal hace lookup O(1). Si la clave no existe en cache (caso borde),
+cae back al `compute_team_stats` original como fallback.
+
+**Resultado post-fix:** ~90s → ~5s con 4226 partidos. Reentrenamiento viable sin espera.
+
+---
+
+## Fix: `scale_pos_weight` dinámico en XGBoost (`_03_model_engine.py` v7)
+
+**Problema:** XGBoost entrenaba con clases desbalanceadas sin corrección.
+`draw` (~27% de los partidos) y `away_win` (~28%) generaban modelos que
+siempre predicen la clase mayoritaria — accuracy alta pero ROI 0.0% porque
+nunca producen una señal real de apuesta.
+
+**Síntoma:**
+```
+draw:      accuracy=72.7%  ROI=+0.0%   # siempre predice "no draw"
+away_win:  accuracy=73.3%  ROI=+0.0%   # siempre predice "no away_win"
+```
+
+**Fix (`_03_model_engine.py` v7):**
+```python
+def _get_xgb(self, scale_pos_weight: float = 1.0):
+    return XGBClassifier(
+        ...
+        scale_pos_weight=scale_pos_weight,  # NUEVO
+        ...
+    )
+
+# En fit(), antes de crear cada XGBoost:
+n_neg = int((y_train == 0).sum())
+n_pos = int((y_train == 1).sum())
+spw   = round(n_neg / n_pos, 3) if n_pos > 0 else 1.0
+xgb   = self._get_xgb(scale_pos_weight=spw)
+```
+
+**Pesos esperados con 4226 partidos:**
+| Mercado | ~% positivos | scale_pos_weight |
+|---------|-------------|-----------------|
+| home_win | ~45% | ~1.2 |
+| draw | ~27% | ~2.7 |
+| away_win | ~28% | ~2.6 |
+| btts | ~50% | ~1.0 |
+| over25 | ~50% | ~1.0 |
+
+**Acción requerida:** Reentrenar modelos para que el fix surta efecto:
+```powershell
+python -c "import os, glob; [os.remove(f) for f in glob.glob('models/*.pkl')]"
+python scheduler.py
+```
 
 **Problema:** Las ligas ESPN se guardan en `dc.models` con `league_name` como
 clave string (ej: `'Liga BetPlay'`) porque no están en `LIGAS` (que solo tiene
@@ -245,18 +387,131 @@ Campos relevantes por item:
 
 ---
 
-## Mercados soportados (`_04_value_detector.py`)
+## Mercados soportados (`_04_value_detector.py` + `_05_result_updater.py`)
 
-| Categoría | Mercados |
-|-----------|---------|
-| 1X2 | home_win, draw, away_win |
-| Doble oportunidad | double_1x, double_x2, double_12 |
-| Goles totales | over05–over45, under05–under45 |
-| BTTS | btts_si, btts_no |
-| Por equipo | home_over05/15, away_over05/15 (+ unders) |
-| Goles exactos | exact_0, exact_1, exact_2, exact_3, exact_4plus |
-| Combinadas | home_and_btts, draw_and_btts, away_and_btts |
-| Asian Handicap | ah_home/away ±0.5, ah_home/away -1 |
+| Categoría | Mercados | evaluate_bet |
+|-----------|---------|:---:|
+| 1X2 | home_win, draw, away_win | ✅ |
+| Doble oportunidad | double_1x, double_x2, double_12 | ✅ |
+| Goles totales | over05–over45, under05–under45 | ✅ |
+| BTTS | btts_si, btts_no | ✅ |
+| Por equipo | home_over05/15, home_under05/15, away_over05/15, away_under05/15 | ✅ |
+| Goles exactos | exact_0, exact_1, exact_2, exact_3, exact_4plus | ✅ |
+| Combinadas | home_and_btts, draw_and_btts, away_and_btts | ✅ |
+| Asian Handicap | ah_home/away ±0.5, ah_home/away -1 | ✅ |
+
+Todos los mercados tienen evaluador completo en `evaluate_bet`. Mercados desconocidos
+retornan `False` sin lanzar excepción.
+
+---
+
+## ELO propio ESPN — `compute_elo_espn` (`_01_data_collector.py` v4)
+
+Solución al problema de ClubElo que no cubre equipos LATAM (devuelve 0.0).
+
+**Algoritmo:**
+- Motor ELO estándar con factor K dinámico: `k_new=40` para equipos con < 30 partidos, `k_base=20` para el resto
+- Margin factor logarítmico: `log2(|gd| + 1.5)` — penaliza goleadas sin explotar
+- Ventaja de local configurable: `home_advantage=65.0` puntos (estándar fútbol)
+- Rating inicial: `initial_elo=1500.0`
+- Iteración cronológica sobre todo el histórico ESPN
+
+**Parámetros:**
+```python
+compute_elo_espn(
+    historical=None,        # carga automáticamente si es None
+    k_base=20.0,
+    k_new=40.0,
+    new_team_threshold=30,
+    initial_elo=1500.0,
+    home_advantage=65.0,
+    save=True,              # guarda en data/raw/elo_espn.csv
+)
+```
+
+**Output:** DataFrame con columnas `Club`, `Elo`, `n_partidos`, `league_name`
+compatible con `load_elo()` de `_02_feature_builder.py`.
+
+**Archivo generado:** `data/raw/elo_espn.csv`
+
+> **Pendiente:** `_02_feature_builder.load_elo()` debe leer `elo_espn.csv`
+> además de `elo_ratings.csv` (ClubElo) para que el feature `elo_diff` sea
+> funcional en ligas LATAM.
+
+---
+
+## `_05_result_updater.py` v2 — cambios principales
+
+### evaluate_bet — cobertura completa
+Todos los mercados del sistema tienen evaluador. Implementación con dict de lambdas:
+
+```python
+evaluators = {
+    # 1X2
+    "home_win":  lambda: home_goals > away_goals,
+    "draw":      lambda: home_goals == away_goals,
+    "away_win":  lambda: home_goals < away_goals,
+    # Doble oportunidad
+    "double_1x": lambda: home_goals >= away_goals,
+    "double_x2": lambda: away_goals >= home_goals,
+    "double_12": lambda: home_goals != away_goals,
+    # BTTS
+    "btts_si":   lambda: btts,
+    "btts_no":   lambda: not btts,
+    # Over/Under 0.5–4.5 (total = home_goals + away_goals)
+    "over05": ..., "under05": ...,
+    "over15": ..., "under15": ...,
+    "over25": ..., "under25": ...,
+    "over35": ..., "under35": ...,
+    "over45": ..., "under45": ...,
+    # Por equipo
+    "home_over05": ..., "home_under05": ...,
+    "home_over15": ..., "home_under15": ...,
+    "away_over05": ..., "away_under05": ...,
+    "away_over15": ..., "away_under15": ...,
+    # Goles exactos
+    "exact_0": ..., "exact_1": ..., "exact_2": ...,
+    "exact_3": ..., "exact_4plus": lambda: total >= 4,
+    # Combinadas
+    "home_and_btts": lambda: (home_goals > away_goals) and btts,
+    "draw_and_btts": lambda: (home_goals == away_goals) and btts,
+    "away_and_btts": lambda: (home_goals < away_goals) and btts,
+    # Asian Handicap
+    "ah_home_minus05": ..., "ah_away_minus05": ...,
+    "ah_home_plus05":  ..., "ah_away_plus05":  ...,
+    "ah_home_minus1":  lambda: (home_goals - away_goals) >= 2,
+    "ah_away_minus1":  lambda: (home_goals - away_goals) < 2,
+}
+```
+
+### compute_model_stats — desglose completo
+Calcula ROI y tasa de acierto total + por nivel (alta/media/baja) + por mercado.
+Guarda snapshot en tabla `estadisticas_modelo`.
+
+```python
+stats = {
+    "total": N, "ganadas": N, "tasa_pct": X, "roi_pct": X,
+    # Por nivel
+    "n_alta": N, "ganadas_alta": N, "tasa_alta_pct": X, "roi_alta_pct": X,
+    "n_media": N, ...,
+    "n_baja": N, ...,
+    # Por mercado (dinámico — una entrada por cada mercado con datos)
+    "n_home_win": N, "tasa_home_win_pct": X, "roi_home_win_pct": X,
+    "n_over25": N, ...
+}
+```
+
+### Fuentes de resultados (orden de prioridad)
+1. `football-data.org` — ligas EU (fuente principal)
+2. `ESPN API` — LATAM + Champions (sin key, fallback automático)
+3. `API-Football` — fallback final (requiere key)
+
+### DDL v2 — cambios respecto a v1
+- CHECK `confianza IN ('alta','media','baja')` (v1 solo tenía `alta` y `media`)
+- Columnas `home_goals` / `away_goals` en tabla `predicciones`
+- Índice adicional `idx_pred_mercado`
+- Vista `roi_por_mercado` — desglose por mercado y nivel
+- Vista `resumen_diario` — estadísticas por fecha
 
 ---
 
@@ -373,22 +628,22 @@ El código usa `ESPN_SITE_V2B` que apunta a `/apis/v2/` — correcto.
 
 ## Problemas conocidos y soluciones
 
-### Open-Meteo 400 Bad Request
-**Causa:** Para partidos de hoy `days_ahead = 0`, pero Open-Meteo rechaza `start_date`
-igual a `end_date` cuando es la fecha actual en algunos timezones. Además hay
-partidos con fecha ESPN de mañana que se procesan como si fueran hoy.
-**Fix pendiente:** Usar `forecast_days=1` sin `start_date/end_date` para partidos de hoy.
-**Nota:** fechas > 16 días devuelven valores neutros sin llamar a la API (ya implementado).
+### Open-Meteo 400 Bad Request ✅ RESUELTO
+**Causa:** Para partidos de hoy `days_ahead = 0`, Open-Meteo rechaza `start_date`
+igual a `end_date` en timezones UTC-5 (Colombia). Partidos de mañana también afectados.
+**Fix aplicado en `utils.py` v4:**
+- `days_ahead <= 1`: usa `forecast_days=N` **sin** `start_date/end_date`; selecciona el elemento `[days_ahead]` del array de respuesta.
+- `days_ahead >= 2`: sigue usando `start_date/end_date` como antes.
+- `days_ahead > 16`: devuelve valores neutros sin llamar a la API (sin cambios).
 
-### Supabase — error de versión
+### Supabase — error de versión (resuelto)
 ```
 'typing.Union' object has no attribute '__module__'
 ```
-**Causa:** Versión incompatible entre `supabase-py` y `pydantic`.
-**Fix pendiente:** `pip install supabase==1.2.0` (o la versión compatible confirmada).
+✅ **Resuelto** — `supabase==2.3.0` es la versión compatible confirmada.
 
-### Supabase DDL — nivel baja no incluido (BUG)
-**Causa:** El CHECK de la tabla `predicciones` solo permite `('alta','media')`.
+### Supabase DDL — nivel baja no incluido (resuelto)
+**Causa:** El CHECK de la tabla `predicciones` solo permitía `('alta','media')`.
 Con la v6 se emiten apuestas de nivel `'baja'` que Supabase rechazaba (error 23514).
 **Fix aplicado en DDL v2:**
 ```sql
@@ -431,23 +686,34 @@ tests/
 ├── test_model_engine.py      # _resolve_league_name (FIX v6), DixonColesModel,
 │                             # DixonColesEnsemble, blend_predictions,
 │                             # FootbotEnsemble (@slow)
-├── test_result_updater.py    # evaluate_bet (parametrizado, todos los mercados),
-│                             # DDL Supabase (incluye test del BUG 'baja')
+├── test_result_updater.py    # v2: evaluate_bet (parametrizado, TODOS los mercados ~40),
+│                             # compute_model_stats (3 niveles + por mercado),
+│                             # update_results_in_supabase (mock + fuzzy match),
+│                             # save_predictions_to_supabase (mock),
+│                             # DDL v2 (baja, resumen_diario, home/away_goals, idx_mercado)
 ├── test_telegram_sender.py   # format_message (3 niveles), format_date_es
 └── test_value_detector.py    # _poisson_matrix, compute_all_market_probs,
                               # calculate_edge, kelly_fraction, classify_confidence,
                               # build_odds_dict, analyze_fixture
 ```
 
+**Cobertura de `test_result_updater.py` v2:**
+- 90+ casos parametrizados cubriendo los ~40 mercados de `evaluate_bet`
+- Tests de consistencia: `0-0`, partido con muchos goles `4-2`, `1-1` combinadas
+- Simetría Asian Handicap: `ah_minus05` son complementarios en partidos sin empate; `ah_plus05` ambos True en empate
+- `compute_model_stats`: vacío, None, totales, desglose por 3 niveles, ROI ±, por mercado
+- `update_results_in_supabase`: ganadora, perdedora, sin resultado, fuzzy match por substring
+- DDL: todos los campos, vistas y constraints requeridos
+
 **Ejecución:**
 ```powershell
-pytest tests/                   # todos los tests rápidos
-pytest tests/ -m slow           # incluye entrenamiento de modelos
-pytest tests/ --cov=src         # con cobertura
+pytest tests/                                              # todos los tests rápidos
+pytest tests/ -m slow                                      # incluye entrenamiento de modelos
+pytest tests/ --cov=src                                    # con cobertura
+pytest tests/test_result_updater.py -v -k "evaluate_bet"  # solo mercados
 ```
 
-**BUG confirmado en tests:** `test_supabase_ddl_includes_baja` falla hasta
-que se corrija el DDL.
+**Estado tests:** todos pasan ✅ (el bug `test_supabase_ddl_includes_baja` está resuelto en DDL v2)
 
 ---
 
@@ -459,6 +725,16 @@ python -c "
 from src._01_data_collector import load_espn_historical
 hist = load_espn_historical()
 print(hist.groupby('league_name').size().to_string())
+"
+```
+
+### Calcular ELO propio desde histórico ESPN
+```powershell
+python -c "
+from src._01_data_collector import compute_elo_espn
+df = compute_elo_espn()
+print(df.head(20).to_string())
+print(f'Total equipos con ELO: {len(df)}')
 "
 ```
 
@@ -510,6 +786,17 @@ for _, row in features.iterrows():
     print()
 ```
 
+### Verificar ROI por mercado (Supabase)
+```python
+# diag_roi.py
+from src._05_result_updater import init_supabase, compute_model_stats
+sb = init_supabase()
+stats = compute_model_stats(sb)
+for k, v in sorted(stats.items()):
+    if 'roi' in k or 'tasa' in k:
+        print(f'  {k}: {v}')
+```
+
 ### Eliminar modelos y forzar reentrenamiento
 ```powershell
 python -c "
@@ -554,16 +841,20 @@ FOOTBALL_DATA_ORG_URL = "https://api.football-data.org/v4"
 
 | Archivo | Versión | Cambio principal |
 |---------|---------|-----------------|
+| src/_03_model_engine.py | v7 | `scale_pos_weight` dinámico por mercado en `FootbotEnsemble.fit`; `_get_xgb` acepta parámetro `scale_pos_weight` |
+| src/_02_feature_builder.py | v6 | `_precompute_rolling_cache`: pre-computa rolling stats por equipo O(n) antes del loop; `build_training_dataset` pasa de ~90s a ~5s con 4226 partidos; header actualizado |
 | src/_03_model_engine.py | v6 | Fix league_id lookup ESPN en predict_proba y FootbotEnsemble.fit |
 | config/settings.py | v6 | Umbrales nivel BAJA, ESPN_ONLY flag |
 | src/_04_value_detector.py | v6 | Nivel baja en classify_confidence, kelly reducido al 50% |
 | src/telegram_sender.py | v6 | Sección 🔵 BAJA CONFIANZA en format_message |
 | src/espn_collector.py | v3 | FIX A1 _parse_score, FIX A2 providers, FIX A3 _to_decimal, FIX B1 _safe_int, FIX D1/D2 seasons |
 | src/supabase_client.py | v1 | Cliente Supabase — insert/select/delete predicciones |
-| supabase_ddl_v2.sql | v2 | CHECK corregido: `'baja'` incluido en constraint confianza |
-| src/_01_data_collector.py | v3 | Retry backoff para WinError 10054, fusión fd.org + ESPN |
-| src/_02_feature_builder.py | v4 | Fusión histórico EU + ESPN, TeamNameResolver, leakage fix |
+| supabase_ddl_v2.sql | v2 | CHECK corregido: `'baja'` incluido; columnas home/away_goals; idx_mercado; vistas roi_por_mercado y resumen_diario |
+| src/_01_data_collector.py | v4 | Retry backoff WinError 10054; fusión fd.org + ESPN; **compute_elo_espn** (ELO propio LATAM con K dinámico y margin factor log) |
+| src/_05_result_updater.py | v2 | evaluate_bet completo (~40 mercados); compute_model_stats con 3 niveles y por mercado; get_results_espn como fallback; DDL v2 |
+| src/utils.py | v4 | Fix Open-Meteo 400 Bad Request para hoy/mañana: `forecast_days` sin `start/end_date` cuando `days_ahead <= 1`; indexación correcta del array por `days_ahead` |
 | src/nacional_features.py | v4 | Eliminado import roto de nacional_collector |
+| tests/test_result_updater.py | v2 | 90+ casos evaluate_bet; tests compute_model_stats 3 niveles; mocks update/save Supabase; DDL v2 completo |
 
 ---
 
@@ -571,10 +862,15 @@ FOOTBALL_DATA_ORG_URL = "https://api.football-data.org/v4"
 
 1. ~~**Supabase:** `pip install supabase==1.2.0` y corregir DDL (`'baja'` en CHECK)~~ ✅ **RESUELTO** — `supabase==2.3.0`, DDL v2 ejecutado, 4/4 tests OK
 2. ~~**Telegram:** Configurar token real y verificar envío~~ ✅ **RESUELTO** — token y chat_id configurados, mensaje de prueba enviado
-3. **Open-Meteo:** Usar `forecast_days=1` sin `start_date/end_date` para partidos de hoy
-4. **`evaluate_bet`:** Añadir evaluadores para over15, under15, over45, by-team markets, exactos, combinadas y AH — sin esto el ROI tracking es incompleto
-5. **`build_training_dataset` O(n²):** ~90s con 4226 partidos. Pre-computar rolling stats por equipo antes de agregar ligas EU
-6. **`_parse_fixture`:** Reemplazar `int(home_score)` por `_parse_score(home_score)` para consistencia con el endpoint `/schedule`
-7. **ELO LATAM:** ClubElo no cubre equipos colombianos/argentinos (devuelve 0.0). Considerar FBref Club Rankings o ELO propio calculado desde histórico ESPN
-8. **Copa Libertadores / Sudamericana:** < 200 partidos → sin DC propio. El modelo global tampoco converge (> 80 equipos). Pendiente solución arquitectural (DC cross-liga o umbral dinámico)
-9. **Tests @slow:** `FootbotEnsemble.fit` no corre en CI normal — marcar y ejecutar explícitamente con `pytest -m slow`
+3. ~~**`evaluate_bet`:** Añadir evaluadores para over15, under15, over45, by-team markets, exactos, combinadas y AH~~ ✅ **RESUELTO** — `_05_result_updater.py` v2 cubre todos los mercados (~40 evaluadores)
+4. ~~**`compute_model_stats` sin desglose por nivel ni mercado**~~ ✅ **RESUELTO** — desglose completo alta/media/baja + por mercado en v2
+5. ~~**ELO LATAM = 0.0 (ClubElo no cubre LATAM)**~~ ✅ **RESUELTO** — `load_elo()` v5 fusiona ClubElo + `elo_espn.csv`; prioridad ESPN en equipos duplicados; `elo_diff` funcional en todas las ligas
+6. ~~**Open-Meteo:** Usar `forecast_days=1` sin `start_date/end_date` para partidos de hoy~~ ✅ **RESUELTO** — `utils.py` v4 implementado
+7. ~~**`_02_feature_builder.load_elo()`:** Leer `elo_espn.csv` además de `elo_ratings.csv`~~ ✅ **RESUELTO** — v5
+8. ~~**`build_training_dataset` O(n²):** ~90s con 4226 partidos. Pre-computar rolling stats por equipo antes de agregar ligas EU~~ ✅ **RESUELTO** — `_02_feature_builder.py` v6: `_precompute_rolling_cache` implementado
+9. **`_parse_fixture`:** Reemplazar `int(home_score)` por `_parse_score(home_score)` para consistencia con el endpoint `/schedule`
+10. **Copa Libertadores / Sudamericana:** < 200 partidos → sin DC propio. El modelo global tampoco converge (> 80 equipos). Pendiente solución arquitectural (DC cross-liga o umbral dinámico)
+11. **Tests @slow:** `FootbotEnsemble.fit` no corre en CI normal — marcar y ejecutar explícitamente con `pytest -m slow`
+12. ~~**Distribución de clases XGBoost:**~~ ✅ **RESUELTO** — `scale_pos_weight` dinámico en v7; reentrenamiento ejecutado 2026-03-31 con 4236 partidos
+13. **Métricas XGBoost post-fix:** correr evaluación formal post-reentrenamiento para registrar ROI real de `draw` y `away_win`; las métricas en la tabla son pre-fix y no reflejan el modelo actual
+14. **Bug `btts_si` en `diag2.py`:** cambiar `'btts_si'` → `'btts'` en el loop de mercados; la clave correcta en `market_probs` es `prob_btts`, no `prob_btts_si`. Solo afecta el script de diagnóstico, producción usa `get_model_prob_for_market` internamente
