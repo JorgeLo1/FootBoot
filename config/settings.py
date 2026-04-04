@@ -46,8 +46,16 @@ LIGAS = {
 # ─── LIGAS ESPN (sin API key) ─────────────────────────────────────────────────
 # slug_espn → (league_id_interno, nombre_display)
 # league_id_interno: rangos 500+ para no colisionar con LIGAS ni COMPETICIONES_NACIONALES
+#
+# RANGOS:
+#   500–519  → LATAM núcleo (ya existentes)
+#   520–529  → LATAM extra (nuevo)
+#   530–539  → Europa ESPN (ligas domésticas via ESPN, backup de fd.co.uk)
+#   540–549  → UEFA copas extra (nuevo)
+#   550–559  → CONCACAF extra (nuevo)
 LIGAS_ESPN: dict[str, tuple[int, str]] = {
-    # Sudamérica — clubes
+
+    # ── Sudamérica clubes ─────────────────────────────────────────────────
     "col.1":                 (501, "Liga BetPlay"),
     "arg.1":                 (502, "Liga Profesional Argentina"),
     "bra.1":                 (503, "Brasileirão Serie A"),
@@ -58,30 +66,90 @@ LIGAS_ESPN: dict[str, tuple[int, str]] = {
     "par.1":                 (508, "Primera División Paraguay"),
     "bol.1":                 (509, "Liga Profesional Bolivia"),
     "ven.1":                 (510, "Primera División Venezuela"),
-    # Sudamérica — copas
+
+    # ── Sudamérica copas ──────────────────────────────────────────────────
     "conmebol.libertadores": (511, "Copa Libertadores"),
     "conmebol.sudamericana": (512, "Copa Sudamericana"),
     "conmebol.recopa":       (513, "Recopa Sudamericana"),
-    # Europa — backup / ampliación
+
+    # ── Europa (backup / ligas con buena cobertura de cuotas ESPN) ────────
     "uefa.champions":        (514, "Champions League"),
     "uefa.europa":           (515, "Europa League"),
     "uefa.europa.conf":      (516, "Conference League"),
-    # CONCACAF
+
+    # ── Europa ligas domésticas vía ESPN ─────────────────────────────────
+    # Solo se usan para histórico y cuotas si ESPN_ONLY=true.
+    # En modo normal (fd.co.uk activo) se omiten en download_espn_historical.
+    "eng.1":                 (530, "Premier League"),
+    "esp.1":                 (531, "La Liga"),
+    "ger.1":                 (532, "Bundesliga"),
+    "ita.1":                 (533, "Serie A"),
+    "fra.1":                 (534, "Ligue 1"),
+    "ned.1":                 (535, "Eredivisie"),
+    "por.1":                 (536, "Primeira Liga"),
+    "tur.1":                 (537, "Süper Lig"),
+    "sco.1":                 (538, "Scottish Premiership"),
+    "bel.1":                 (539, "Pro League Bélgica"),
+
+    # ── CONCACAF ─────────────────────────────────────────────────────────
     "concacaf.champions":    (517, "Concacaf Champions Cup"),
     "mex.1":                 (518, "Liga MX"),
     "usa.1":                 (519, "MLS"),
+
+    # ── Clasificatorias mundialistas y copas continentales ────────────────
+    # (datos históricos útiles para modelo de selecciones)
+    "bra.2":                 (520, "Brasileirão Serie B"),
+    "arg.copa":              (521, "Copa Argentina"),
+    "conmebol.america":      (522, "Copa América"),
+}
+
+# ── Conjuntos de slugs por región ─────────────────────────────────────────────
+# Útil para filtrar en download_espn_historical y en el scheduler.
+
+# Ligas de clubes LATAM con volumen de partidos suficiente para DC propio
+SLUGS_LATAM_CLUBES: set[str] = {
+    "col.1", "arg.1", "bra.1", "chi.1", "per.1",
+    "ecu.1", "uru.1", "par.1", "mex.1",
+}
+
+# Copas CONMEBOL — volumen bajo, sin DC propio (requieren backfill completo)
+SLUGS_LATAM_COPAS: set[str] = {
+    "conmebol.libertadores", "conmebol.sudamericana", "conmebol.recopa",
+}
+
+# Ligas europeas que ESPN cubre y que se usan SOLO cuando ESPN_ONLY=true
+SLUGS_EU_ESPN: set[str] = {
+    "eng.1", "esp.1", "ger.1", "ita.1", "fra.1", "ned.1",
+    "por.1", "tur.1", "sco.1", "bel.1",
+}
+
+# Ligas UEFA de clubes con cuotas ESPN disponibles
+SLUGS_UEFA_COPAS: set[str] = {
+    "uefa.champions", "uefa.europa", "uefa.europa.conf",
 }
 
 # Slugs activos para predicciones diarias
 # (los que tienen volumen suficiente de partidos para entrenar el modelo)
+# AMPLIADO: se añaden chi.1, per.1, ecu.1, uru.1, par.1 y las copas UEFA.
 LIGAS_ESPN_ACTIVAS: set[str] = {
+    # LATAM núcleo — ya funcionaban
     "col.1",
     "arg.1",
     "bra.1",
+    "mex.1",
+    # LATAM ampliación — suficiente histórico post-backfill
+    "chi.1",
+    "per.1",
+    "ecu.1",
+    "uru.1",
+    "par.1",
+    # Copas sudamericanas
     "conmebol.libertadores",
     "conmebol.sudamericana",
+    # UEFA
     "uefa.champions",
-    "mex.1",
+    "uefa.europa",
+    "uefa.europa.conf",
 }
 
 # ─── COMPETICIONES DE SELECCIONES NACIONALES ─────────────────────────────────
@@ -95,10 +163,36 @@ COMPETICIONES_NACIONALES_ESPN: dict[str, tuple[int, str]] = {
     "fifa.worldq.uefa":     (600, "Eliminatorias UEFA"),
     "fifa.worldq.concacaf": (601, "Eliminatorias CONCACAF"),
     "caf.nations":          (602, "Copa África de Naciones"),
+    "concacaf.nations.league": (603, "Concacaf Nations League"),
 }
 
 # IDs tier-1 de selecciones (competiciones oficiales, no amistosos)
-TIER_1_NATIONAL_LEAGUES: set[int] = {361, 271, 1, 4, 5, 30, 600, 601}
+TIER_1_NATIONAL_LEAGUES: set[int] = {361, 271, 1, 4, 5, 30, 600, 601, 603}
+
+# ─── FEATURE FLAGS ────────────────────────────────────────────────────────────
+# Controlan qué fuentes de datos adicionales se activan.
+# Se pueden sobreescribir desde .env.
+
+# Activar descarga de lesiones desde ESPN (teams/{id}/injuries)
+# Añade feature `home_injured_starters` / `away_injured_starters` al modelo.
+ESPN_INJURIES_ENABLED: bool = os.getenv("ESPN_INJURIES_ENABLED", "true").lower() == "true"
+
+# Activar ESPN BPI (win probability pre-partido desde /summary?event={id})
+# Añade feature `espn_bpi_home` / `espn_bpi_away` al modelo.
+# NOTA: ESPN BPI no devuelve datos para ligas LATAM (confirmado 0/12, 2026-04-02).
+# Se desactiva automáticamente para slugs en SLUGS_SIN_BPI para evitar
+# llamadas a la API que siempre devuelven 0.
+ESPN_BPI_ENABLED: bool = os.getenv("ESPN_BPI_ENABLED", "true").lower() == "true"
+
+# Slugs para los que ESPN BPI no tiene datos — se omite el enriquecimiento BPI
+# aunque ESPN_BPI_ENABLED=true. Evita llamadas innecesarias y features con valor 0.
+SLUGS_SIN_BPI: set[str] = SLUGS_LATAM_CLUBES | SLUGS_LATAM_COPAS | {
+    "conmebol.libertadores", "conmebol.sudamericana", "conmebol.recopa",
+    "concacaf.champions", "mex.1", "usa.1",
+}
+
+# Activar descarga de standings para feature de posición en tabla
+ESPN_STANDINGS_FEATURES: bool = os.getenv("ESPN_STANDINGS_FEATURES", "true").lower() == "true"
 
 # ─── UMBRALES DE CONFIANZA ────────────────────────────────────────────────────
 UMBRAL_EDGE_ALTA   = 8.0
@@ -109,11 +203,7 @@ MIN_PARTIDOS_ALTA  = 30
 MIN_PARTIDOS_MEDIA = 15
 KELLY_FRACCION     = 0.25
 
-# ── Nivel BAJA (nuevo) ────────────────────────────────────────────────────────
-# Solo se activa con cuotas reales (ESPN o fd.co.uk).
-# Requiere edge positivo mínimo y probabilidad razonable.
-# Para mercados 1X2 y Over/Under estándar: edge >= 2% y prob >= 52%.
-# Restricción de partidos mínimos más laxa para equipos con poco historial.
+# ── Nivel BAJA ────────────────────────────────────────────────────────────────
 UMBRAL_EDGE_BAJA   = 2.0
 UMBRAL_PROB_BAJA   = 0.52
 MIN_PARTIDOS_BAJA  = 6
@@ -134,6 +224,30 @@ XGB_N_ESTIMATORS       = 300
 XGB_MAX_DEPTH          = 4
 XGB_LEARNING_RATE      = 0.05
 RANDOM_SEED            = 42
+
+# ─── PONDERACIÓN TEMPORAL (time decay) ────────────────────────────────────────
+# Controla cuánto "pesan" los partidos más antiguos vs los recientes.
+#
+# DC_TIME_DECAY_XI (ξ): factor de decaimiento para Dixon-Coles.
+#   Cada partido recibe weight = exp(−ξ × días_atrás).
+#   ξ = 0.003 → semivida ~231 días (un partido de hace 1 año vale ~33% de hoy).
+#   ξ = 0.005 → semivida ~139 días (más agresivo, favorece últimas 2 temporadas).
+#   ξ = 0.0   → todos los partidos pesan igual (comportamiento anterior).
+#   Rango recomendado para sweep: 0.001 a 0.006 (paso 0.001).
+DC_TIME_DECAY_XI: float = float(os.getenv("DC_TIME_DECAY_XI", "0.003"))
+
+# XGB_TIME_DECAY_LAMBDA (λ): factor de decaimiento para sample_weight en XGBoost.
+#   weight = exp(−λ × días_atrás).
+#   λ = 0.002 → semivida ~347 días. Partidos de 2022 pesan ~15% de los de 2026.
+#   λ = 0.003 → semivida ~231 días. Más agresivo.
+#   λ = 0.0   → todos los partidos pesan igual (comportamiento anterior).
+#   Rango recomendado para sweep: 0.001 a 0.005 (paso 0.001).
+XGB_TIME_DECAY_LAMBDA: float = float(os.getenv("XGB_TIME_DECAY_LAMBDA", "0.002"))
+
+# Fecha de referencia para calcular días_atrás en entrenamiento.
+# None = usa date.today() automáticamente (recomendado para producción).
+# Se puede fijar a una fecha específica para reproducibilidad en tests/sweeps.
+TIME_DECAY_REFERENCE_DATE: str | None = os.getenv("TIME_DECAY_REFERENCE_DATE", None)
 
 # ─── RATE LIMITS ─────────────────────────────────────────────────────────────
 API_FOOTBALL_DAILY_LIMIT = 100
@@ -160,3 +274,8 @@ CLUBELO_URL           = "http://api.clubelo.com"
 ESPN_SITE_V2  = "https://site.api.espn.com/apis/site/v2/sports/soccer"
 ESPN_SITE_V2B = "https://site.api.espn.com/apis/v2/sports/soccer"       # standings (fix)
 ESPN_CORE_V2  = "https://sports.core.api.espn.com/v2/sports/soccer/leagues"
+
+# ─── TEMPORADAS HISTÓRICAS ESPN ───────────────────────────────────────────────
+# Ampliado a 2022. Se extiende automáticamente cada año sin tocar este archivo.
+ESPN_HISTORICAL_SEASONS: list[int] = list(range(2022, date.today().year + 1))
+# Resultado actual (2026-03-31): [2022, 2023, 2024, 2025, 2026]

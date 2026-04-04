@@ -1,13 +1,25 @@
 """
-_01_data_collector.py
+_01_data_collector.py — v6
 Descarga y normaliza todas las fuentes de datos.
 
 FIXES v3:
   - download_football_data: retry con backoff exponencial para WinError 10054
-    (servidor Football-Data.co.uk cerrando conexiones). Usa Session con
-    headers apropiados y pausa entre ligas para evitar bloqueo.
   - _get_fixtures_fdorg: mismo retry para fixtures del día.
-  - get_weather_for_fixture: delegado a utils.py (coordenadas LATAM).
+  - get_weather_for_fixture: delegado a utils.py
+
+NUEVO v6:
+  - download_espn_historical: lógica de grupos para nuevas ligas.
+    * LATAM núcleo (col.1, arg.1, bra.1, chi.1, per.1, ecu.1, uru.1, par.1, mex.1)
+      → siempre se descargan.
+    * Ligas EU vía ESPN (eng.1, esp.1, ger.1, etc.)
+      → solo se descargan si ESPN_ONLY=true (fallback cuando fd.co.uk no está disponible).
+    * UEFA copas (uefa.europa, uefa.europa.conf)
+      → se descargan siempre (no cubiertas por fd.co.uk).
+    * LATAM copas (conmebol.libertadores, conmebol.sudamericana)
+      → se descargan siempre (no cubiertas por fd.co.uk).
+  - load_espn_historical: carga todos los CSVs de LIGAS_ESPN_ACTIVAS sin filtro EU.
+  - Importa ESPN_ONLY, SLUGS_LATAM_CLUBES, SLUGS_LATAM_COPAS, SLUGS_EU_ESPN,
+    SLUGS_UEFA_COPAS desde settings.py v6.
 
 Fuentes:
   - Fixtures del día        : football-data.org (free, 10 req/min) +
@@ -42,6 +54,10 @@ from config.settings import (
     FOOTBALL_DATA_URL, FOOTBALL_DATA_SEASONS,
     CLUBELO_URL, CURRENT_SEASON,
     LIGAS_ESPN, LIGAS_ESPN_ACTIVAS,
+    ESPN_HISTORICAL_SEASONS,
+    ESPN_ONLY,
+    SLUGS_LATAM_CLUBES, SLUGS_LATAM_COPAS,
+    SLUGS_EU_ESPN, SLUGS_UEFA_COPAS,
 )
 from src.utils import get_weather_for_fixture, ApiRateLimiter  # noqa: F401
 
@@ -52,19 +68,16 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Slugs EU cubiertos por fd.co.uk (no descargar via ESPN en modo normal)
+_EU_SLUGS_FDUK: set[str] = {"eng.1", "esp.1", "ger.1", "ita.1", "fra.1", "ned.1", "por.1"}
+
 
 # ─── SESSION CON RETRY ───────────────────────────────────────────────────────
 
 def _make_session(retries: int = 4, backoff: float = 1.5) -> requests.Session:
     """
     Session con retry automático y backoff exponencial.
-
-    Motivo: Football-Data.co.uk cierra conexiones activamente (WinError 10054)
-    cuando recibe requests muy seguidas o con user-agent genérico.
-    Con retry + backoff + headers realistas esto se resuelve en la mayoría
-    de los casos sin intervención manual.
-
-    retries=4, backoff=1.5 → esperas de 1.5, 3, 6, 12 segundos.
+    Football-Data.co.uk cierra conexiones activamente (WinError 10054).
     """
     session = requests.Session()
     session.headers.update({
@@ -91,7 +104,6 @@ def _make_session(retries: int = 4, backoff: float = 1.5) -> requests.Session:
     return session
 
 
-# Sesión reutilizable para Football-Data.co.uk
 _FD_SESSION = _make_session()
 
 
@@ -101,9 +113,7 @@ def get_fixtures_today() -> pd.DataFrame:
     """
     Obtiene los partidos del día combinando:
       1. football-data.org para las 7 ligas europeas (fuente principal con cuotas)
-      2. ESPN API para ligas adicionales (Col, Arg, Bra, Libertadores, etc.)
-
-    Retorna un DataFrame unificado con el schema estándar de FOOTBOT.
+      2. ESPN API para ligas adicionales (Col, Arg, Bra, Chi, UEFA, etc.)
     """
     frames = []
 
@@ -138,10 +148,7 @@ def get_fixtures_today() -> pd.DataFrame:
 
 
 def _get_fixtures_fdorg() -> pd.DataFrame:
-    """
-    Fixtures desde football-data.org (7 ligas EU, 10 req/min).
-    FIX: usa _make_session() con retry para WinError 10054.
-    """
+    """Fixtures desde football-data.org (7 ligas EU, 10 req/min)."""
     if not FOOTBALL_DATA_ORG_KEY:
         log.warning(
             "FOOTBALL_DATA_ORG_KEY no configurada. "
@@ -181,7 +188,7 @@ def _get_fixtures_fdorg() -> pd.DataFrame:
                         "source":      "fdorg",
                     })
                 log.info(f"✓ Fixtures {league_name}: OK")
-                break  # éxito — salir del loop de reintentos
+                break
 
             except Exception as e:
                 wait = 2 ** attempt * 3
@@ -194,7 +201,7 @@ def _get_fixtures_fdorg() -> pd.DataFrame:
                 else:
                     log.error(f"Fixtures {league_name}: abandonado tras 3 intentos")
 
-        time.sleep(6)  # respetar 10 req/min del free tier
+        time.sleep(6)
 
     return pd.DataFrame(rows)
 
@@ -220,11 +227,7 @@ def _get_fixtures_espn_today() -> pd.DataFrame:
 # ─── RESULTADOS DEL DÍA ──────────────────────────────────────────────────────
 
 def get_results_fdorg(target_date: str) -> dict:
-    """
-    Resultados finalizados de football-data.org para una fecha.
-    FIX: usa session con retry para WinError 10054.
-    Retorna {(home_team, away_team): {home_goals, away_goals, fixture_id, status}}
-    """
+    """Resultados finalizados de football-data.org."""
     if not FOOTBALL_DATA_ORG_KEY:
         return {}
 
@@ -255,7 +258,7 @@ def get_results_fdorg(target_date: str) -> dict:
                         "fixture_id": match["id"],
                         "status":     match["status"],
                     }
-                break  # éxito
+                break
 
             except Exception as e:
                 wait = 2 ** attempt * 3
@@ -273,10 +276,7 @@ def get_results_fdorg(target_date: str) -> dict:
 
 
 def get_results_today(target_date: str = None) -> dict:
-    """
-    Resultados del día fusionando fd.org (EU) + ESPN (resto).
-    Usado por _05_result_updater como fuente unificada.
-    """
+    """Resultados del día fusionando fd.org (EU) + ESPN (resto)."""
     if target_date is None:
         target_date = date.today().strftime("%Y-%m-%d")
 
@@ -288,7 +288,7 @@ def get_results_today(target_date: str = None) -> dict:
         log.warning(f"fd.org resultados falló: {e}")
 
     try:
-        from src.espn_collector import get_results_espn, TODOS_LOS_SLUGS, LIGAS_ESPN
+        from src.espn_collector import get_results_espn, LIGAS_ESPN
         ligas_eu_ids = set(LIGAS.keys())
         slugs_extra  = {
             k: v for k, v in LIGAS_ESPN.items()
@@ -308,16 +308,7 @@ def get_results_today(target_date: str = None) -> dict:
 # ─── DATOS HISTÓRICOS EU (Football-Data.co.uk) ───────────────────────────────
 
 def download_football_data() -> dict:
-    """
-    Descarga CSVs de Football-Data.co.uk para las 7 ligas EU.
-
-    FIX: retry con backoff exponencial para WinError 10054.
-    El servidor cierra conexiones cuando recibe requests muy seguidas.
-    Estrategia:
-      - Session con User-Agent de browser real
-      - 3 intentos por CSV con espera 3s, 6s, 12s
-      - Pausa de 2s entre ligas (además del retry)
-    """
+    """Descarga CSVs de Football-Data.co.uk para las 7 ligas EU."""
     dfs = {}
 
     for league_id, (league_name, fd_code, _) in LIGAS.items():
@@ -328,11 +319,9 @@ def download_football_data() -> dict:
 
             for attempt in range(3):
                 try:
-                    # Usar _FD_SESSION con User-Agent de browser
                     resp = _FD_SESSION.get(url, timeout=20)
                     resp.raise_for_status()
 
-                    # Leer CSV desde el contenido en memoria (evita re-request)
                     import io
                     df = pd.read_csv(
                         io.StringIO(resp.content.decode("latin-1")),
@@ -342,10 +331,10 @@ def download_football_data() -> dict:
                     df["league_name"] = league_name
                     frames.append(df)
                     log.info(f"✓ {league_name} {season}: {len(df)} partidos")
-                    break  # éxito
+                    break
 
                 except Exception as e:
-                    wait = (2 ** attempt) * 3  # 3s, 6s, 12s
+                    wait = (2 ** attempt) * 3
                     if attempt < 2:
                         log.warning(
                             f"Intento {attempt+1}/3 fallido {league_name} {season}: {e} "
@@ -355,7 +344,6 @@ def download_football_data() -> dict:
                     else:
                         log.warning(f"No disponible {league_name} {season}: {e}")
 
-            # Pausa corta entre temporadas para no saturar
             time.sleep(0.5)
 
         if frames:
@@ -365,23 +353,41 @@ def download_football_data() -> dict:
             dfs[fd_code] = combined
             log.info(f"→ {fd_code}: {len(combined)} partidos totales")
 
-        # Pausa entre ligas
         time.sleep(2)
 
     return dfs
 
 
-# ─── DATOS HISTÓRICOS ESPN (ligas sin cobertura EU) ──────────────────────────
+# ─── DATOS HISTÓRICOS ESPN ────────────────────────────────────────────────────
 
 def download_espn_historical(fetch_plays: bool = False,
                               max_per_team: int = None,
                               seasons: list[int] = None) -> dict:
     """
-    Descarga histórico ESPN para las ligas activas que no cubre fd.co.uk.
-    Se llama durante el re-entrenamiento semanal (lunes).
+    v6: Descarga histórico ESPN con lógica de grupos.
 
-    FIX: pasa seasons a build_historical_espn para datos multi-temporada.
-    max_per_team ya no es necesario — se mantiene por compatibilidad.
+    GRUPOS DE DESCARGA:
+    ─────────────────────────────────────────────────────────────────────────
+    Grupo A — LATAM clubes (siempre):
+        col.1, arg.1, bra.1, chi.1, per.1, ecu.1, uru.1, par.1, mex.1
+        → Núcleo del bot. Se descargan siempre independientemente de ESPN_ONLY.
+
+    Grupo B — Copas CONMEBOL y UEFA (siempre):
+        conmebol.libertadores, conmebol.sudamericana, conmebol.recopa
+        uefa.champions, uefa.europa, uefa.europa.conf
+        → No cubiertas por fd.co.uk. Se descargan siempre.
+
+    Grupo C — Ligas EU vía ESPN (solo si ESPN_ONLY=true):
+        eng.1, esp.1, ger.1, ita.1, fra.1, ned.1, por.1, tur.1, sco.1, bel.1
+        → En modo normal, fd.co.uk es la fuente para estas ligas.
+          Se descargan via ESPN solo cuando ESPN_ONLY=true como fallback.
+
+    Grupo D — Otras ligas activas en LIGAS_ESPN_ACTIVAS no incluidas arriba:
+        → Se descargan si están en LIGAS_ESPN_ACTIVAS y no en ningún otro grupo.
+    ─────────────────────────────────────────────────────────────────────────
+
+    seasons=None usa ESPN_HISTORICAL_SEASONS (2022–año actual).
+    max_per_team se mantiene por compatibilidad pero se ignora.
     """
     try:
         from src.espn_collector import ESPNClient, build_historical_espn
@@ -389,16 +395,43 @@ def download_espn_historical(fetch_plays: bool = False,
         log.error(f"No se pudo importar espn_collector: {e}")
         return {}
 
+    if seasons is None:
+        seasons = ESPN_HISTORICAL_SEASONS
+
     client = ESPNClient(delay=0.5)
     dfs    = {}
 
-    eu_slugs = {"eng.1", "esp.1", "ger.1", "ita.1", "fra.1", "ned.1", "por.1"}
+    # Determinar qué slugs descargar según grupos
+    slugs_a_descargar: set[str] = set()
+
+    # Grupo A: LATAM clubes — siempre
+    slugs_a_descargar |= SLUGS_LATAM_CLUBES
+
+    # Grupo B: Copas CONMEBOL + UEFA copas — siempre
+    slugs_a_descargar |= SLUGS_LATAM_COPAS
+    slugs_a_descargar |= SLUGS_UEFA_COPAS
+
+    # Grupo C: Ligas EU vía ESPN — solo si ESPN_ONLY
+    if ESPN_ONLY:
+        slugs_a_descargar |= SLUGS_EU_ESPN
+        log.info("ESPN_ONLY=true — incluyendo ligas EU vía ESPN en descarga histórica")
+    else:
+        log.info("ESPN_ONLY=false — ligas EU cubiertas por fd.co.uk, saltando en ESPN")
+
+    # Grupo D: resto de LIGAS_ESPN_ACTIVAS no incluidas
+    for slug in LIGAS_ESPN_ACTIVAS:
+        if slug not in slugs_a_descargar:
+            slugs_a_descargar.add(slug)
+            log.info(f"Grupo D: añadido {slug} (activo pero no en grupos A/B/C)")
+
+    log.info(
+        f"Descargando histórico ESPN para {len(slugs_a_descargar)} ligas "
+        f"(temporadas {seasons})"
+    )
 
     for slug, (league_id, league_name) in LIGAS_ESPN.items():
-        if slug not in LIGAS_ESPN_ACTIVAS:
-            continue
-        if slug in eu_slugs:
-            log.info(f"Saltando {league_name} — ya cubierta por fd.co.uk")
+        if slug not in slugs_a_descargar:
+            log.debug(f"Saltando {league_name} ({slug}) — no en lista de descarga")
             continue
 
         try:
@@ -409,18 +442,22 @@ def download_espn_historical(fetch_plays: bool = False,
             )
             if not df.empty:
                 dfs[slug] = df
-                log.info(f"✓ ESPN {league_name}: {len(df)} partidos")
+                log.info(f"✓ ESPN {league_name}: {len(df)} partidos (temporadas {seasons})")
+            else:
+                log.warning(f"ESPN {league_name}: 0 partidos descargados")
         except Exception as e:
             log.warning(f"Error ESPN {league_name}: {e}")
 
+    log.info(f"Descarga ESPN completada: {len(dfs)} ligas con datos")
     return dfs
 
 
 def load_espn_historical() -> pd.DataFrame:
     """
     Carga todos los CSVs ESPN guardados en data/raw/espn_*.csv.
+    v6: sin filtro EU — carga todas las ligas en LIGAS_ESPN_ACTIVAS.
     """
-    frames = []
+    frames  = []
     raw_dir = Path(DATA_RAW)
 
     for slug, (league_id, league_name) in LIGAS_ESPN.items():
@@ -457,11 +494,7 @@ def load_espn_historical() -> pd.DataFrame:
 
 def get_best_closing_odds(home_team: str, away_team: str,
                            historical: pd.DataFrame) -> dict | None:
-    """
-    Busca las últimas cuotas de cierre reales para un enfrentamiento.
-    Prioridad: Pinnacle > Bet365 > Betway.
-    Solo disponible para ligas cubiertas por Football-Data.co.uk.
-    """
+    """Busca las últimas cuotas de cierre reales para un enfrentamiento."""
     from src._02_feature_builder import normalize_team_name
 
     h = normalize_team_name(home_team)
@@ -631,6 +664,9 @@ def run():
         "elo":             elo,
     }
 
+
+# ─── ELO ESPN ────────────────────────────────────────────────────────────────
+
 def compute_elo_espn(
     historical: pd.DataFrame = None,
     k_base: float = 20.0,
@@ -642,112 +678,78 @@ def compute_elo_espn(
 ) -> pd.DataFrame:
     """
     Calcula ratings ELO para todos los equipos del histórico ESPN.
- 
-    Parámetros
-    ----------
-    historical        : DataFrame del histórico ESPN (de load_espn_historical).
-                        Si es None, lo carga automáticamente.
-    k_base            : Factor K estándar (equipos con > new_team_threshold partidos).
-    k_new             : Factor K elevado para equipos nuevos (primeros partidos).
-    new_team_threshold: Partidos necesarios para pasar de K_new a K_base.
-    initial_elo       : Rating de entrada para equipos sin historial.
-    home_advantage    : Ventaja de local en puntos Elo (≈ 65 estándar fútbol).
-    save              : Si True, guarda en data/raw/elo_espn.csv.
- 
-    Retorna
-    -------
-    DataFrame con columnas: Club, Elo, n_partidos, league_name
-    Compatible con load_elo() de _02_feature_builder.py.
+    v6: sin cambios — ahora se alimenta de más ligas gracias al catálogo ampliado.
     """
-    import sys
-    from pathlib import Path
-    sys.path.insert(0, str(Path(__file__).parent.parent))
- 
     if historical is None:
-        from src._01_data_collector import load_espn_historical
         historical = load_espn_historical()
- 
+
     if historical.empty:
-        import logging
-        logging.getLogger(__name__).warning(
-            "compute_elo_espn: histórico vacío — sin datos para calcular ELO."
-        )
+        log.warning("compute_elo_espn: histórico vacío — sin datos para calcular ELO.")
         return pd.DataFrame(columns=["Club", "Elo", "n_partidos", "league_name"])
- 
-    # Asegurar orden cronológico
+
     hist = historical.copy()
     hist["match_date"] = pd.to_datetime(hist["match_date"], errors="coerce")
     hist = hist.dropna(subset=["match_date", "home_goals", "away_goals"])
     hist = hist.sort_values("match_date").reset_index(drop=True)
- 
-    # Estado del motor ELO
+
     ratings: dict[str, float] = {}
     games_played: dict[str, int] = {}
     last_league: dict[str, str] = {}
- 
+
     def _get_rating(team: str) -> float:
         return ratings.get(team, initial_elo)
- 
+
     def _get_k(team: str) -> float:
         n = games_played.get(team, 0)
         return k_new if n < new_team_threshold else k_base
- 
+
     def _margin_factor(goal_diff: int) -> float:
-        """
-        Multiplicador logarítmico para la diferencia de goles.
-        Fórmula FiveThirtyEight: ln(|gd| + 1) / (coef autocorrelación)
-        Simplificada: log2(|gd| + 1.5) — suave, sin explotar.
-        """
         return math.log(abs(goal_diff) + 1.5, 2)
- 
+
     def _expected(ra: float, rb: float) -> float:
         return 1.0 / (1.0 + 10.0 ** ((rb - ra) / 400.0))
- 
-    # Iterar partidos cronológicamente
+
     for _, row in hist.iterrows():
         home = str(row.get("home_team", "")).strip()
         away = str(row.get("away_team", "")).strip()
         if not home or not away:
             continue
- 
+
         try:
             hg = int(row["home_goals"])
             ag = int(row["away_goals"])
         except (ValueError, TypeError):
             continue
- 
+
         league = str(row.get("league_name", ""))
         last_league[home] = league
         last_league[away] = league
- 
-        ra = _get_rating(home) + home_advantage   # local con ventaja
+
+        ra = _get_rating(home) + home_advantage
         rb = _get_rating(away)
- 
-        # Resultado real: 1 local, 0.5 empate, 0 visitante
+
         if hg > ag:
             s_home, s_away = 1.0, 0.0
         elif hg == ag:
             s_home, s_away = 0.5, 0.5
         else:
             s_home, s_away = 0.0, 1.0
- 
+
         e_home = _expected(ra, rb)
         e_away = 1.0 - e_home
- 
+
         gd = abs(hg - ag)
         mf = _margin_factor(gd)
- 
+
         k_home = _get_k(home)
         k_away = _get_k(away)
- 
-        # Actualizar ratings (sin la ventaja de local — es solo para cálculo)
+
         ratings[home] = _get_rating(home) + k_home * mf * (s_home - e_home)
         ratings[away] = _get_rating(away) + k_away * mf * (s_away - e_away)
- 
+
         games_played[home] = games_played.get(home, 0) + 1
         games_played[away] = games_played.get(away, 0) + 1
- 
-    # Construir DataFrame final
+
     records = []
     for team, elo in ratings.items():
         records.append({
@@ -756,19 +758,16 @@ def compute_elo_espn(
             "n_partidos":   games_played.get(team, 0),
             "league_name":  last_league.get(team, ""),
         })
- 
+
     df_elo = pd.DataFrame(records).sort_values("Elo", ascending=False).reset_index(drop=True)
- 
+
     if save:
-        from config.settings import DATA_RAW
         path = Path(DATA_RAW) / "elo_espn.csv"
         df_elo.to_csv(path, index=False)
-        import logging
-        logging.getLogger(__name__).info(
-            f"ELO ESPN calculado: {len(df_elo)} equipos → {path}"
-        )
- 
+        log.info(f"ELO ESPN calculado: {len(df_elo)} equipos → {path}")
+
     return df_elo
+
 
 if __name__ == "__main__":
     run()

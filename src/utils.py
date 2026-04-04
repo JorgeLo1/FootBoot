@@ -11,10 +11,18 @@ FIXES v3:
 FIXES v4:
   - Open-Meteo 400 Bad Request para hoy/mañana: usar forecast_days sin
     start_date/end_date cuando days_ahead <= 1; indexar el array por days_ahead.
+
+FIXES v5:
+  - Retry con backoff exponencial en get_weather_for_fixture: reintenta hasta
+    MAX_RETRIES veces ante SSLEOFError, ConnectionError y Timeout.
+    Observado SSLEOFError intermitente en 3 partidos colombianos (2026-04-02).
+    El backoff es 1s → 2s → 4s con jitter ±0.3s para evitar thundering herd.
 """
 
 import os
 import json
+import time
+import random
 import logging
 import requests
 from datetime import date, datetime, timedelta
@@ -252,6 +260,18 @@ API_ALERT_THRESHOLD = 20
 # Open-Meteo soporta pronóstico hasta 16 días adelante
 _METEO_MAX_FORECAST_DAYS = 16
 
+# Retry config para Open-Meteo (v5)
+_METEO_MAX_RETRIES  = 3      # intentos máximos por llamada
+_METEO_BACKOFF_BASE = 1.0    # segundos base de espera
+_METEO_JITTER       = 0.3    # ±jitter aleatorio para evitar thundering herd
+
+# Excepciones que justifican reintento (SSL, red, timeout)
+_RETRYABLE_EXCEPTIONS = (
+    requests.exceptions.SSLError,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+)
+
 
 def get_weather_for_fixture(home_team: str, match_datetime) -> dict:
     """
@@ -263,6 +283,12 @@ def get_weather_for_fixture(home_team: str, match_datetime) -> dict:
       evitando el 400 Bad Request que Open-Meteo lanza cuando start_date == hoy
       en timezones UTC-5 (Colombia, etc.). Se selecciona el índice correcto del array.
     - Para fechas 2-16 días adelante sigue usando start_date/end_date.
+
+    FIX v5:
+    - Retry con backoff exponencial: reintenta hasta _METEO_MAX_RETRIES veces
+      ante SSLEOFError, ConnectionError y Timeout.
+      Backoff: base * 2^intento ± jitter (1s → 2s → 4s).
+      Observado SSLEOFError intermitente en Colombia (2026-04-02).
     """
     from config.settings import OPENMETEO_URL
 
@@ -296,50 +322,67 @@ def get_weather_for_fixture(home_team: str, match_datetime) -> dict:
         return {"temp_max": 18.0, "precipitation": 0.0, "wind_max": 12.0,
                 "rain_flag": 0, "wind_flag": 0}
 
-    try:
-        # Open-Meteo da 400 Bad Request cuando start_date == hoy en algunos
-        # timezones. Para partidos de hoy (days_ahead == 0) o mañana (== 1)
-        # usamos forecast_days sin start/end_date y seleccionamos el día correcto.
-        # Para fechas futuras (2-16 días) sí usamos start_date/end_date.
-        if days_ahead <= 1:
-            params: dict = {
-                "latitude":      lat,
-                "longitude":     lon,
-                "timezone":      "auto",
-                "daily":         "precipitation_sum,windspeed_10m_max,temperature_2m_max",
-                "forecast_days": max(2, days_ahead + 1),
-            }
-        else:
-            params = {
-                "latitude":      lat,
-                "longitude":     lon,
-                "timezone":      "auto",
-                "daily":         "precipitation_sum,windspeed_10m_max,temperature_2m_max",
-                "forecast_days": days_ahead + 1,
-                "start_date":    ds,
-                "end_date":      ds,
-            }
-
-        r = requests.get(OPENMETEO_URL, params=params, timeout=8)
-        r.raise_for_status()
-        d   = r.json().get("daily", {})
-        # Cuando usamos forecast_days sin start_date, el array arranca desde hoy.
-        # El día que nos interesa está en el índice days_ahead.
-        idx  = days_ahead if days_ahead <= 1 else 0
-        prec = (d.get("precipitation_sum") or [0] * (idx + 1))[idx] or 0
-        wind = (d.get("windspeed_10m_max") or [10] * (idx + 1))[idx] or 10
-        temp = (d.get("temperature_2m_max") or [15] * (idx + 1))[idx] or 15
-        return {
-            "temp_max":      float(temp),
-            "precipitation": float(prec),
-            "wind_max":      float(wind),
-            "rain_flag":     int(prec > 2),
-            "wind_flag":     int(wind > 30),
+    # Construir params (igual que v4)
+    if days_ahead <= 1:
+        params: dict = {
+            "latitude":      lat,
+            "longitude":     lon,
+            "timezone":      "auto",
+            "daily":         "precipitation_sum,windspeed_10m_max,temperature_2m_max",
+            "forecast_days": max(2, days_ahead + 1),
         }
-    except Exception as e:
-        log.warning(f"Error clima para {home_team} ({ds}): {e}")
-        return {"temp_max": 15.0, "precipitation": 0.0, "wind_max": 10.0,
-                "rain_flag": 0, "wind_flag": 0}
+    else:
+        params = {
+            "latitude":      lat,
+            "longitude":     lon,
+            "timezone":      "auto",
+            "daily":         "precipitation_sum,windspeed_10m_max,temperature_2m_max",
+            "forecast_days": days_ahead + 1,
+            "start_date":    ds,
+            "end_date":      ds,
+        }
+
+    # Retry con backoff exponencial (v5)
+    last_exc: Exception = Exception("sin intentos")
+    for attempt in range(_METEO_MAX_RETRIES):
+        try:
+            r = requests.get(OPENMETEO_URL, params=params, timeout=8)
+            r.raise_for_status()
+            d   = r.json().get("daily", {})
+            idx  = days_ahead if days_ahead <= 1 else 0
+            prec = (d.get("precipitation_sum") or [0] * (idx + 1))[idx] or 0
+            wind = (d.get("windspeed_10m_max") or [10] * (idx + 1))[idx] or 10
+            temp = (d.get("temperature_2m_max") or [15] * (idx + 1))[idx] or 15
+            return {
+                "temp_max":      float(temp),
+                "precipitation": float(prec),
+                "wind_max":      float(wind),
+                "rain_flag":     int(prec > 2),
+                "wind_flag":     int(wind > 30),
+            }
+        except _RETRYABLE_EXCEPTIONS as e:
+            last_exc = e
+            wait = _METEO_BACKOFF_BASE * (2 ** attempt) + random.uniform(-_METEO_JITTER, _METEO_JITTER)
+            wait = max(0.1, wait)
+            log.warning(
+                f"Open-Meteo intento {attempt + 1}/{_METEO_MAX_RETRIES} "
+                f"falló para {home_team} ({ds}): {type(e).__name__}. "
+                f"Reintentando en {wait:.1f}s..."
+            )
+            time.sleep(wait)
+        except Exception as e:
+            # Error no retriable (ej: 400 Bad Request, JSON inválido) — fallar rápido
+            log.warning(f"Error clima para {home_team} ({ds}): {e}")
+            return {"temp_max": 15.0, "precipitation": 0.0, "wind_max": 10.0,
+                    "rain_flag": 0, "wind_flag": 0}
+
+    # Agotados todos los reintentos
+    log.error(
+        f"Open-Meteo: {_METEO_MAX_RETRIES} intentos fallidos para "
+        f"{home_team} ({ds}). Último error: {last_exc}. Usando valores neutros."
+    )
+    return {"temp_max": 15.0, "precipitation": 0.0, "wind_max": 10.0,
+            "rain_flag": 0, "wind_flag": 0}
 
 
 # ─── RATE LIMITER PARA API-FOOTBALL ─────────────────────────────────────────

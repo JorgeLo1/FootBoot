@@ -22,6 +22,16 @@ CAMBIOS v5 (fix):
      el modelo global para evitar inestabilidad numérica.
   4. maxfun=15000 como hard stop de seguridad.
 
+CAMBIOS v8 (threshold por mercado):
+  1. MARKET_THRESHOLDS: dict con threshold de decisión por mercado.
+     El mercado `draw` usa 0.33 (análisis eval_v7.py: 50 señales, ROI +24.5%).
+     El resto mantiene 0.50 (comportamiento anterior).
+  2. _compute_validation_roi: usa MARKET_THRESHOLDS[market] en lugar del
+     hardcode 0.50, para que las métricas de validación reflejen el threshold real.
+  3. FootbotEnsemble.predict: expone xgb_signal_{market} (bool) usando
+     MARKET_THRESHOLDS, para que _04_value_detector pueda filtrar señales
+     con el threshold correcto sin duplicar lógica.
+
 CAMBIOS v6 (fix league_id lookup):
   1. DixonColesEnsemble.predict_proba: las ligas ESPN se guardan con
      league_name como clave (no league_id numérico) porque no están en LIGAS
@@ -31,6 +41,22 @@ CAMBIOS v6 (fix league_id lookup):
      siempre al modelo global con probabilidades por defecto.
   2. FootbotEnsemble.fit: el mismo fix se aplica al pre-cálculo de probs DC
      en el set de validación para la optimización de blend weights.
+
+CAMBIOS v11 (ponderación temporal — time decay):
+  1. DixonColesModel.fit: acepta parámetro `xi` (float). Cada partido recibe
+     un peso temporal w = exp(−ξ × días_atrás), calculado respecto a una
+     fecha de referencia (hoy por defecto). xi=0.0 reproduce el comportamiento
+     anterior exactamente. xi=0.003 → semivida ~231 días.
+     Requiere columna `match_date` en el DataFrame de entrenamiento.
+     El peso se aplica multiplicando la log-likelihood de cada partido.
+  2. FootbotEnsemble.fit: calcula sample_weight por fila del set de
+     entrenamiento usando w = exp(−λ × días_atrás). λ leído de
+     XGB_TIME_DECAY_LAMBDA en settings. λ=0.0 reproduce comportamiento anterior.
+     El peso temporal se combina multiplicativamente con scale_pos_weight
+     (que sigue activo para balancear clases).
+  3. Ambos parámetros (xi, λ) son configurables desde .env:
+     DC_TIME_DECAY_XI y XGB_TIME_DECAY_LAMBDA.
+     Valor 0.0 en ambos = sin decay = comportamiento v10 idéntico.
 """
 
 import os
@@ -54,6 +80,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.settings import (
     DATA_PROCESSED, MODELS_DIR, RANDOM_SEED,
     XGB_N_ESTIMATORS, XGB_MAX_DEPTH, XGB_LEARNING_RATE, LIGAS,
+    DC_TIME_DECAY_XI, XGB_TIME_DECAY_LAMBDA, TIME_DECAY_REFERENCE_DATE,
 )
 
 logging.basicConfig(level=logging.INFO,
@@ -65,6 +92,19 @@ MIN_MATCHES_PER_LIGA  = 200    # mínimo para entrenar DC por liga individual
 MIN_MATCHES_GLOBAL_DC = 300    # mínimo para entrenar DC global
 MAX_TEAMS_GLOBAL_DC   = 80     # si hay más equipos, DC global es inestable
 DEFAULT_DC_WEIGHT     = 0.35   # fallback si no hay optimización
+
+# Threshold de decisión por mercado (v8).
+# draw usa 0.33 en lugar de 0.50 — análisis eval_v7.py (2026-03-31):
+#   threshold=0.50 → 0 señales | threshold=0.33 → 50 señales, ROI +24.5%, acc 44%
+# La cuota justa del empate (~1/0.33 ≈ 3.0) cubre el 44% de acierto con ROI positivo.
+# Validar con cuotas reales antes de cambiar otros mercados.
+MARKET_THRESHOLDS: dict[str, float] = {
+    "home_win": 0.50,
+    "draw":     0.33,
+    "away_win": 0.50,
+    "btts":     0.50,
+    "over25":   0.50,
+}
 
 FEATURE_COLS = [
     "home_xg_scored",    "home_xg_conceded",   "home_goals_scored",
@@ -79,6 +119,29 @@ FEATURE_COLS = [
     "xg_total_exp",      "goals_diff",          "forma_diff",
     "rest_diff",         "fatiga_flag",
     "rain_flag",         "wind_flag",
+    # features v9: lesiones ESPN
+    "home_injury_score", "away_injury_score",   "injury_score_diff",
+    # BPI: se usa flag binario en lugar de las probs crudas.
+    # ESPN BPI no devuelve datos para ligas LATAM (siempre 0 por fillna),
+    # lo que introduce ruido sin información. El flag `bpi_available` permite
+    # al modelo distinguir "BPI=0 por ausencia de datos" de "BPI=0 real".
+    # Re-activar espn_bpi_home_prob/away_prob si se confirma cobertura EU
+    # con feature importance > 0 en reentrenamiento formal.
+    "bpi_available",
+    # features v11: standings context — motivación
+    # Capturan la "urgencia" de cada equipo en el momento del partido.
+    # Un equipo en zona de descenso en las últimas jornadas rinde diferente
+    # a su ELO promedio. Features derivadas del endpoint /standings ESPN.
+    # fillna(0) en build_training_dataset → retrocompatible con histórico sin standings.
+    "home_relegation_threat",   "away_relegation_threat",
+    "home_title_race",          "away_title_race",
+    "home_clasif_race",         "away_clasif_race",
+    "home_motivation_score",    "away_motivation_score",
+    "home_standing_pts_per_game","away_standing_pts_per_game",
+    "home_points_to_safety",    "away_points_to_safety",
+    "home_es_tramo_final",      "away_es_tramo_final",
+    "motivation_diff",          "pressure_asymmetry",
+    "rank_diff",                "points_diff_standing",
 ]
 
 INFERENCE_EXTRA_COLS = [
@@ -138,7 +201,7 @@ class DixonColesModel:
         return 1.0
 
     def _neg_log_likelihood(self, params, teams, home_teams, away_teams,
-                            home_goals, away_goals):
+                            home_goals, away_goals, weights=None):
         n        = len(teams)
         attack   = dict(zip(teams, params[:n]))
         defense  = dict(zip(teams, params[n:2*n]))
@@ -156,12 +219,31 @@ class DixonColesModel:
             tau = self._tau(hg, ag, mu, lam, rho)
             if tau <= 0 or mu <= 0 or lam <= 0:
                 continue
-            ll += np.log(tau) + poisson.logpmf(hg, mu) + poisson.logpmf(ag, lam)
+            match_ll = np.log(tau) + poisson.logpmf(hg, mu) + poisson.logpmf(ag, lam)
+            # v11: aplicar peso temporal si se proporcionó
+            w = weights[i] if weights is not None else 1.0
+            ll += w * match_ll
         return -ll
 
-    def fit(self, df: pd.DataFrame):
+    def fit(self, df: pd.DataFrame, xi: float = None,
+            reference_date: date = None):
+        """
+        Entrena Dixon-Coles sobre df.
+
+        v11: parámetro xi (float) para time decay.
+          Cada partido i recibe peso w_i = exp(−xi × días_atrás_i).
+          xi=0.0 → todos los partidos pesan igual (comportamiento anterior).
+          xi=None → usa DC_TIME_DECAY_XI de settings.
+          reference_date=None → usa date.today().
+
+        Requiere columna `match_date` (datetime) en df para calcular días_atrás.
+        Si match_date no está presente se entrena sin decay (xi=0).
+        """
         label = f"liga={self.league_id}"
         log.info(f"Entrenando Dixon-Coles ({label})...")
+
+        if xi is None:
+            xi = DC_TIME_DECAY_XI
 
         required = ["home_team_norm", "away_team_norm", "home_goals", "away_goals"]
         if not all(c in df.columns for c in required):
@@ -181,6 +263,30 @@ class DixonColesModel:
         home_goals = df["home_goals"].astype(int).tolist()
         away_goals = df["away_goals"].astype(int).tolist()
 
+        # ── Time decay weights ─────────────────────────────────────────────
+        weights = None
+        if xi > 0 and "match_date" in df.columns:
+            ref = reference_date or date.today()
+            if TIME_DECAY_REFERENCE_DATE:
+                try:
+                    ref = date.fromisoformat(TIME_DECAY_REFERENCE_DATE)
+                except ValueError:
+                    pass
+            ref_dt = pd.Timestamp(ref)
+            days_ago = (ref_dt - pd.to_datetime(df["match_date"])).dt.days.clip(lower=0)
+            weights = np.exp(-xi * days_ago.values).tolist()
+            w_min, w_max = min(weights), max(weights)
+            log.info(
+                f"DC ({label}): time decay xi={xi} | "
+                f"pesos rango [{w_min:.3f}, {w_max:.3f}] | "
+                f"suma efectiva = {sum(weights):.1f} (de {len(weights)} partidos)"
+            )
+        elif xi > 0:
+            log.warning(
+                f"DC ({label}): xi={xi} pero no hay columna match_date — "
+                "entrenando sin decay."
+            )
+
         teams = sorted(set(home_teams + away_teams))
         n     = len(teams)
         x0    = np.zeros(2 * n + 2)
@@ -190,7 +296,7 @@ class DixonColesModel:
         result = minimize(
             self._neg_log_likelihood,
             x0,
-            args=(teams, home_teams, away_teams, home_goals, away_goals),
+            args=(teams, home_teams, away_teams, home_goals, away_goals, weights),
             method="L-BFGS-B",
             options={
                 "maxiter": 200,
@@ -209,11 +315,12 @@ class DixonColesModel:
         self.fitted    = True
         self.n_teams   = n
         self.n_matches = len(df)
+        self.xi        = xi  # guardar para inspección / serialización
 
         log.info(
             f"DC ({label}): {n} equipos | {len(df)} partidos | "
             f"home_adv={self.home_adv:.3f} | rho={self.rho:.3f} | "
-            f"convergió={result.success} | iter={result.nit}"
+            f"xi={xi:.4f} | convergió={result.success} | iter={result.nit}"
         )
         return self
 
@@ -318,7 +425,8 @@ class DixonColesEnsemble:
                     league_name,
                 )
                 log.info(f"─── DC {league_name} ({len(group)} partidos) ───")
-                model = DixonColesModel(league_id=lid).fit(group)
+                # v11: pasar xi leído de settings (configurable por .env)
+                model = DixonColesModel(league_id=lid).fit(group, xi=DC_TIME_DECAY_XI)
                 if model.fitted:
                     self.models[lid] = model
                     log.info(f"  DC {league_name}: OK (clave={repr(lid)})")
@@ -408,8 +516,10 @@ def _fit_calibrator(raw_probs: np.ndarray, y: np.ndarray):
 
 # ─── VALIDACIÓN CON ROI ───────────────────────────────────────────────────────
 
-def _compute_validation_roi(cal_probs, y_true, reference_odds=None):
-    preds    = (cal_probs > 0.5).astype(int)
+def _compute_validation_roi(cal_probs, y_true, reference_odds=None, market: str = None):
+    # v8: usar threshold por mercado (draw=0.33 en lugar de 0.50)
+    threshold = MARKET_THRESHOLDS.get(market, 0.50) if market else 0.50
+    preds    = (cal_probs > threshold).astype(int)
     accuracy = float((preds == y_true).mean())
     brier    = float(np.mean((cal_probs - y_true) ** 2))
 
@@ -505,6 +615,30 @@ class FootbotEnsemble:
         X = df[available].fillna(0).values
         self.fitted_features = available
 
+        # ── v11: calcular sample_weight temporal para todo el dataset ────
+        # w = exp(−λ × días_atrás). λ=0 → todos pesan igual (comportamiento anterior).
+        sample_weights_all = None
+        if XGB_TIME_DECAY_LAMBDA > 0 and "match_date" in df.columns:
+            ref = date.today()
+            if TIME_DECAY_REFERENCE_DATE:
+                try:
+                    ref = date.fromisoformat(TIME_DECAY_REFERENCE_DATE)
+                except ValueError:
+                    pass
+            ref_dt = pd.Timestamp(ref)
+            days_ago = (ref_dt - pd.to_datetime(df["match_date"])).dt.days.clip(lower=0)
+            sample_weights_all = np.exp(-XGB_TIME_DECAY_LAMBDA * days_ago.values)
+            log.info(
+                f"XGBoost sample_weight: lambda={XGB_TIME_DECAY_LAMBDA} | "
+                f"pesos rango [{sample_weights_all.min():.3f}, {sample_weights_all.max():.3f}] | "
+                f"peso medio={sample_weights_all.mean():.3f}"
+            )
+        elif XGB_TIME_DECAY_LAMBDA > 0:
+            log.warning(
+                "XGB_TIME_DECAY_LAMBDA > 0 pero no hay columna match_date "
+                "en el dataset — entrenando sin sample_weight temporal."
+            )
+
         ref_odds_map = {}
         if "B365H" in df.columns:
             ref_odds_map["home_win"] = df["B365H"].dropna().median()
@@ -588,7 +722,10 @@ class FootbotEnsemble:
             )
 
             xgb = self._get_xgb(scale_pos_weight=spw)
+            # v11: combinar sample_weight temporal con split de entrenamiento
+            sw_train = sample_weights_all[:split] if sample_weights_all is not None else None
             xgb.fit(X_train, y_train,
+                    sample_weight=sw_train,
                     eval_set=[(X_val, y_val)],
                     verbose=False)
 
@@ -597,7 +734,7 @@ class FootbotEnsemble:
             cal_val = cal.transform(raw_val)
 
             ref_odds = ref_odds_map.get(market)
-            metrics  = _compute_validation_roi(cal_val, y_val, ref_odds)
+            metrics  = _compute_validation_roi(cal_val, y_val, ref_odds, market=market)
             self.validation_metrics[market] = metrics
 
             log.info(
@@ -643,6 +780,12 @@ class FootbotEnsemble:
             raw = xgb.predict_proba(X)[0, 1]
             cal = float(self.calibrators[market].transform(np.array([raw]))[0])
             result[f"xgb_prob_{market}"] = round(cal, 4)
+            # v8: señal de apuesta usando threshold por mercado.
+            # draw usa 0.33 — los demás mantienen 0.50.
+            # _04_value_detector debe consultar xgb_signal_{market} para
+            # decidir si el modelo "activa" ese mercado en este partido.
+            threshold = MARKET_THRESHOLDS.get(market, 0.50)
+            result[f"xgb_signal_{market}"] = bool(cal > threshold)
         return result
 
     def get_top_features(self, market: str, n: int = 5) -> list:

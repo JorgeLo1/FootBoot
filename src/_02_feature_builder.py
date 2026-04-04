@@ -1,5 +1,5 @@
 """
-_02_feature_builder.py
+_02_feature_builder.py — v7
 Construye todas las variables predictivas para cada partido.
 
 CAMBIOS v4:
@@ -7,14 +7,28 @@ CAMBIOS v4:
      con ESPN histórico (ligas sin cobertura EU, sin cuotas).
   2. normalize_team_name usa rapidfuzz para matching robusto.
   3. TeamNameResolver construye vocabulario canónico desde datos históricos
-     de AMBAS fuentes, resolviendo diferencias de nombre entre APIs.
+     de AMBAS fuentes.
   4. build_training_dataset excluye market_prob_* (data leakage fix).
-  5. build_features_for_fixtures enriquece con cuotas ESPN en tiempo real
-     si el fixture viene de una liga ESPN y las cuotas están disponibles.
+  5. build_features_for_fixtures enriquece con cuotas ESPN en tiempo real.
 
 CAMBIOS v5:
-  6. build_training_dataset O(n²) → O(n): _precompute_rolling_cache pre-calcula
-     stats de forma por equipo antes del loop principal. ~90s → ~5s con 4226 partidos.
+  6. build_training_dataset O(n²) → O(n): _precompute_rolling_cache.
+
+CAMBIOS v6:
+  7. load_elo() fusiona ClubElo + elo_espn.csv (ELO propio LATAM).
+
+CAMBIOS v7 (nuevo):
+  8. build_features_for_fixtures enriquece con lesiones ESPN si
+     ESPN_INJURIES_ENABLED=true. Features añadidas:
+       home_injured_count, home_injury_score, home_out_count
+       away_injured_count, away_injury_score, away_out_count
+  9. build_features_for_fixtures enriquece con ESPN BPI si
+     ESPN_BPI_ENABLED=true. Features añadidas:
+       espn_bpi_home_prob, espn_bpi_away_prob, espn_bpi_available
+  10. build_training_dataset incluye columnas de lesiones/BPI como NaN
+      (no disponibles en histórico) para mantener schema consistente.
+  11. FEATURE_COLS actualizado para incluir injury_score y bpi cuando
+      están disponibles (acceso condicional seguro).
 """
 
 import os
@@ -29,6 +43,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config.settings import (
     DATA_RAW, DATA_STATSBOMB, DATA_PROCESSED,
     VENTANA_FORMA, LAMBDA_DECAY, LIGAS,
+    ESPN_INJURIES_ENABLED, ESPN_BPI_ENABLED,
+    ESPN_STANDINGS_FEATURES,
 )
 from src.utils import get_weather_for_fixture  # noqa: F401
 
@@ -149,21 +165,16 @@ def exponential_weight(days_ago: float, lam: float = LAMBDA_DECAY) -> float:
     return np.exp(-lam * max(days_ago, 0))
 
 
-# ─── CARGA DE DATOS HISTÓRICOS (EU + ESPN fusionados) ────────────────────────
+# ─── CARGA DE DATOS HISTÓRICOS ───────────────────────────────────────────────
 
 def load_historical_results() -> pd.DataFrame:
     """
     Carga y fusiona datos históricos de todas las fuentes:
       1. Football-Data.co.uk (7 ligas EU) — incluye cuotas B365, Pinnacle
-      2. ESPN API (ligas activas no EU) — solo goles, sin cuotas históricas
-
-    El resolver de nombres se inicializa con el vocabulario combinado,
-    lo que permite fuzzy matching cross-fuente (ej: "Atlético Nacional"
-    en ESPN vs posibles variantes en otros datasets).
+      2. ESPN API (ligas activas) — goles, sin cuotas históricas
     """
     frames_eu = []
 
-    # ── Fuente 1: Football-Data.co.uk ────────────────────────────────────
     for _, (league_name, fd_code, _) in LIGAS.items():
         path = os.path.join(DATA_RAW, f"fd_{fd_code}.csv")
         if os.path.exists(path):
@@ -204,19 +215,16 @@ def load_historical_results() -> pd.DataFrame:
             if col in raw_eu.columns:
                 raw_eu[col] = pd.to_numeric(raw_eu[col], errors="coerce")
 
-    # ── Fuente 2: ESPN histórico ──────────────────────────────────────────
     raw_espn = pd.DataFrame()
     try:
         from src._01_data_collector import load_espn_historical
         raw_espn = load_espn_historical()
 
         if not raw_espn.empty:
-            # Añadir columnas de cuotas vacías para schema unificado
             for col in ["B365H", "B365D", "B365A", "PSH", "PSD", "PSA",
                         "B365>2.5", "B365<2.5"]:
                 if col not in raw_espn.columns:
                     raw_espn[col] = np.nan
-            # Asegurar columna date_str para compatibilidad
             if "date_str" not in raw_espn.columns:
                 raw_espn["date_str"] = raw_espn["match_date"].astype(str)
 
@@ -224,9 +232,7 @@ def load_historical_results() -> pd.DataFrame:
     except Exception as e:
         log.warning(f"No se pudo cargar ESPN histórico: {e}")
 
-    # ── Fusión ────────────────────────────────────────────────────────────
     if not raw_eu.empty and not raw_espn.empty:
-        # Alinear columnas comunes antes de concat
         common_cols = ["home_team", "away_team", "home_goals", "away_goals",
                        "match_date", "league_name", "source",
                        "B365H", "B365D", "B365A", "PSH", "PSD", "PSA",
@@ -250,12 +256,10 @@ def load_historical_results() -> pd.DataFrame:
         log.error("Sin datos históricos de ninguna fuente.")
         return pd.DataFrame()
 
-    # ── Normalización final ───────────────────────────────────────────────
     raw["match_date"] = pd.to_datetime(raw["match_date"], errors="coerce")
     raw = raw.dropna(subset=["match_date", "home_goals", "away_goals"])
     raw = raw.sort_values("match_date").reset_index(drop=True)
 
-    # Inicializar resolver con vocabulario combinado
     init_resolver(raw)
 
     raw["home_team_norm"] = raw["home_team"].apply(normalize_team_name)
@@ -292,16 +296,11 @@ def load_match_summary() -> pd.DataFrame:
 
 def load_elo() -> pd.DataFrame:
     """
-    Carga ELO ratings fusionando dos fuentes:
-      1. elo_ratings.csv  — ClubElo (ligas EU)
-      2. elo_espn.csv     — ELO propio calculado desde histórico ESPN (LATAM)
-
-    Si un equipo aparece en ambas fuentes, se prioriza elo_espn.csv (más
-    actualizado y con mayor cobertura LATAM).
+    Carga ELO ratings fusionando ClubElo (EU) + elo_espn.csv (LATAM).
+    Prioriza ESPN en equipos duplicados.
     """
     frames = []
 
-    # Fuente 1: ClubElo (EU)
     path_clubelo = os.path.join(DATA_RAW, "elo_ratings.csv")
     if os.path.exists(path_clubelo):
         df_clubelo = pd.read_csv(path_clubelo)
@@ -313,7 +312,6 @@ def load_elo() -> pd.DataFrame:
     else:
         log.warning("elo_ratings.csv no encontrado — solo se usará elo_espn.csv")
 
-    # Fuente 2: ELO propio ESPN (LATAM + todos los equipos del histórico)
     path_espn = os.path.join(DATA_RAW, "elo_espn.csv")
     if os.path.exists(path_espn):
         df_espn = pd.read_csv(path_espn)
@@ -324,18 +322,13 @@ def load_elo() -> pd.DataFrame:
         log.info(f"ELO ESPN cargado: {len(df_espn)} equipos")
     else:
         log.warning(
-            "elo_espn.csv no encontrado. Ejecuta compute_elo_espn() en _01_data_collector.py "
-            "para generar ELO de equipos LATAM."
+            "elo_espn.csv no encontrado. Ejecuta compute_elo_espn() en _01_data_collector.py."
         )
 
     if not frames:
         return pd.DataFrame()
 
     combined = pd.concat(frames, ignore_index=True)
-
-    # Deduplicar: si el mismo equipo aparece en ambas fuentes, quedarse con ESPN
-    # (más reciente y con cobertura LATAM). Usar drop_duplicates con keep='last'
-    # tras ordenar para que 'espn' quede al final.
     source_order = {"clubelo": 0, "espn": 1}
     combined["_source_order"] = combined["_source"].map(source_order).fillna(0)
     combined = combined.sort_values("_source_order")
@@ -482,7 +475,7 @@ def compute_team_stats(team: str, is_home: bool,
         f"{p}_fouls_avg":       round(fouls_avg,     2),
         f"{p}_days_rest":       days_rest,
         f"{p}_n_matches":       len(df),
-        f"{p}_n_matches_total": n_total,   # ← FIX: este es el que usa classify_confidence
+        f"{p}_n_matches_total": n_total,
     }
 
 
@@ -587,8 +580,15 @@ def build_features_for_fixtures(fixtures: pd.DataFrame,
     """
     Construye features para todos los fixtures del día.
 
-    espn_client: si se pasa, enriquece fixtures de ligas ESPN con cuotas
-    en tiempo real desde el Core API (/odds).
+    v7: además de cuotas ESPN, enriquece con:
+      - Lesiones (si ESPN_INJURIES_ENABLED=true y espn_client disponible)
+      - ESPN BPI (si ESPN_BPI_ENABLED=true y espn_client disponible)
+
+    v8 (standings context): enriquece con features de motivación si
+      ESPN_STANDINGS_FEATURES=true. Añade relegation_threat, title_race,
+      motivation_score, etc. para local y visitante.
+
+    espn_client: si se pasa, activa el enriquecimiento con fuentes ESPN en tiempo real.
     """
     log.info("Cargando datos históricos para feature building...")
     historical    = load_historical_results()
@@ -600,14 +600,93 @@ def build_features_for_fixtures(fixtures: pd.DataFrame,
         log.error("Sin datos históricos. Imposible calcular features.")
         return pd.DataFrame()
 
-    # Enriquecer fixtures con cuotas ESPN en tiempo real
+    # ── Enriquecimiento con fuentes ESPN en tiempo real ───────────────────
     if espn_client is not None and not fixtures.empty:
+
+        # 1. Cuotas en tiempo real
         try:
             from src.espn_collector import enrich_fixtures_with_odds
             fixtures = enrich_fixtures_with_odds(espn_client, fixtures)
-            log.info("Fixtures enriquecidos con cuotas ESPN en tiempo real")
+            log.info("Fixtures enriquecidos con cuotas ESPN")
         except Exception as e:
             log.warning(f"No se pudo enriquecer con cuotas ESPN: {e}")
+
+        # 2. Lesiones (v7 — NUEVO)
+        if ESPN_INJURIES_ENABLED:
+            try:
+                from src.espn_collector import enrich_fixtures_with_injuries
+                fixtures = enrich_fixtures_with_injuries(espn_client, fixtures)
+                log.info("Fixtures enriquecidos con lesiones ESPN")
+            except Exception as e:
+                log.warning(f"No se pudo enriquecer con lesiones ESPN: {e}")
+
+        # 3. ESPN BPI (v7 — NUEVO, v8 — condicional por liga)
+        # ESPN BPI no devuelve datos para ligas LATAM. Se salta el enriquecimiento
+        # cuando el slug de la liga está en SLUGS_SIN_BPI para ahorrar llamadas
+        # a la API que siempre devuelven 0.
+        if ESPN_BPI_ENABLED:
+            try:
+                from config.settings import SLUGS_SIN_BPI
+                # Detectar slugs de los fixtures actuales
+                slugs_en_fixtures: set[str] = set()
+                if "slug" in fixtures.columns:
+                    slugs_en_fixtures = set(fixtures["slug"].dropna().unique())
+                elif "league_id" in fixtures.columns:
+                    # Mapeo inverso league_id → slug desde LIGAS_ESPN
+                    from config.settings import LIGAS_ESPN
+                    _id_to_slug = {lid: slug for slug, (lid, _) in LIGAS_ESPN.items()}
+                    for lid in fixtures["league_id"].dropna().unique():
+                        s = _id_to_slug.get(int(lid))
+                        if s:
+                            slugs_en_fixtures.add(s)
+
+                # Solo llamar al API si hay al menos un slug con BPI disponible
+                slugs_con_bpi = slugs_en_fixtures - SLUGS_SIN_BPI
+                if slugs_con_bpi:
+                    from src.espn_collector import enrich_fixtures_with_bpi
+                    fixtures = enrich_fixtures_with_bpi(espn_client, fixtures)
+                    log.info(f"Fixtures enriquecidos con ESPN BPI (slugs: {slugs_con_bpi})")
+                else:
+                    log.info("ESPN BPI omitido — todos los slugs son LATAM/sin cobertura BPI")
+            except Exception as e:
+                log.warning(f"No se pudo enriquecer con ESPN BPI: {e}")
+
+        # 4. Standings context — motivación (v8 — NUEVO)
+        # Una sola llamada por liga, cacheada en memoria durante el pipeline.
+        # Añade relegation_threat, title_race, motivation_score, etc.
+        _standings_context: dict = {}
+        if ESPN_STANDINGS_FEATURES:
+            try:
+                from src.espn_collector import (
+                    get_standings_context, enrich_fixtures_with_standings,
+                )
+                from config.settings import LIGAS_ESPN, LIGAS_ESPN_ACTIVAS
+
+                # Solo pedir standings de las ligas que aparecen en los fixtures
+                ligas_en_fixtures: dict[str, tuple] = {}
+                if "league_id" in fixtures.columns:
+                    _id_to_slug = {lid: (slug, name)
+                                   for slug, (lid, name) in LIGAS_ESPN.items()}
+                    for lid in fixtures["league_id"].dropna().unique():
+                        info = _id_to_slug.get(int(lid))
+                        if info:
+                            slug_f, name_f = info
+                            if slug_f in LIGAS_ESPN_ACTIVAS:
+                                ligas_en_fixtures[slug_f] = (int(lid), name_f)
+
+                if ligas_en_fixtures:
+                    _standings_context = get_standings_context(
+                        espn_client, slugs=ligas_en_fixtures
+                    )
+                    fixtures = enrich_fixtures_with_standings(
+                        fixtures, _standings_context
+                    )
+                    log.info(
+                        f"Fixtures enriquecidos con standings context "
+                        f"({len(ligas_en_fixtures)} ligas)"
+                    )
+            except Exception as e:
+                log.warning(f"No se pudo enriquecer con standings context: {e}")
 
     ref_date     = datetime.now()
     all_features = []
@@ -653,7 +732,7 @@ def build_features_for_fixtures(fixtures: pd.DataFrame,
             **market,
         }
 
-        # Cuotas ESPN en tiempo real si están disponibles
+        # ── Cuotas ESPN ───────────────────────────────────────────────────
         if fixture.get("espn_odds_available"):
             feature_row["espn_odds_home"]     = fixture.get("espn_odds_home")
             feature_row["espn_odds_draw"]      = fixture.get("espn_odds_draw")
@@ -662,6 +741,56 @@ def build_features_for_fixtures(fixtures: pd.DataFrame,
             feature_row["espn_odds_available"] = True
         else:
             feature_row["espn_odds_available"] = False
+
+        # ── Lesiones ESPN (v7 — NUEVO) ────────────────────────────────────
+        feature_row["home_injured_count"]  = fixture.get("home_injured_count",  0)
+        feature_row["home_injury_score"]   = fixture.get("home_injury_score",   0.0)
+        feature_row["home_out_count"]      = fixture.get("home_out_count",      0)
+        feature_row["away_injured_count"]  = fixture.get("away_injured_count",  0)
+        feature_row["away_injury_score"]   = fixture.get("away_injury_score",   0.0)
+        feature_row["away_out_count"]      = fixture.get("away_out_count",      0)
+
+        # Diferencial de lesiones: positivo = visitante más afectado que local
+        feature_row["injury_score_diff"] = round(
+            feature_row["away_injury_score"] - feature_row["home_injury_score"], 2
+        )
+
+        # ── ESPN BPI (v7 — NUEVO, v8 — flag bpi_available) ──────────────────
+        # Se guarda el flag binario `bpi_available` en lugar de las probs crudas.
+        # Las probs siempre son 0 en LATAM (fillna), lo que introduce ruido.
+        # El flag permite al modelo distinguir ausencia de dato vs BPI real=0.
+        bpi_home = fixture.get("espn_bpi_home_prob")
+        bpi_away = fixture.get("espn_bpi_away_prob")
+        bpi_avail = bool(fixture.get("espn_bpi_available", False))
+        feature_row["espn_bpi_home_prob"] = bpi_home   # guardado para diagnóstico
+        feature_row["espn_bpi_away_prob"] = bpi_away   # guardado para diagnóstico
+        feature_row["espn_bpi_available"] = bpi_avail
+        feature_row["bpi_available"]      = int(bpi_avail)  # feature binaria para XGBoost
+
+        # ── Standings context — motivación (v8 — NUEVO) ──────────────────
+        # Features de situación en tabla: relegation_threat, title_race,
+        # motivation_score, points_to_safety, rank, etc.
+        # Se propagan desde fixtures (ya enriquecido por enrich_fixtures_with_standings).
+        _standing_cols = [
+            "standing_rank", "standing_points", "standing_pts_per_game",
+            "standing_goal_diff", "points_to_safety", "points_to_clasif",
+            "title_race", "clasif_race", "relegation_threat",
+            "season_progress", "es_tramo_final", "motivation_score",
+        ]
+        for prefix in ("home", "away"):
+            for col in _standing_cols:
+                val = fixture.get(f"{prefix}_{col}", float("nan"))
+                # Convertir NaN a 0 para XGBoost — NaN significa "dato no disponible"
+                # (equipo no encontrado en standings, p.ej. copa con fase de grupos)
+                import math
+                feature_row[f"{prefix}_{col}"] = 0.0 if (val is None or (isinstance(val, float) and math.isnan(val))) else val
+
+        # Diferenciales de motivación
+        for diff_col in ("rank_diff", "points_diff_standing",
+                         "motivation_diff", "pressure_asymmetry"):
+            val = fixture.get(diff_col, 0.0)
+            import math
+            feature_row[diff_col] = 0.0 if (val is None or (isinstance(val, float) and math.isnan(val))) else val
 
         all_features.append(feature_row)
 
@@ -696,18 +825,11 @@ def _precompute_rolling_cache(
     window: int = VENTANA_FORMA,
 ) -> dict[tuple, dict]:
     """
-    Pre-computa stats de forma por (team_norm, is_home, match_idx) para todos
-    los equipos del histórico. Convierte build_training_dataset de O(n²) a O(n).
-
-    Retorna un dict keyed por (team_norm, is_home, idx) → stats dict.
-    La clave `idx` es el índice del partido SIGUIENTE a computar (i.e. el partido
-    actual usa `past = historical.iloc[:idx]`, así que guardamos stats "justo antes
-    de este partido").
+    Pre-computa stats de forma por (team_norm, is_home, match_idx).
+    O(n) en lugar de O(n²).
     """
     log.info("Pre-computando rolling stats por equipo (O(n) cache)...")
 
-    # Indexar partidos por equipo para acceso O(1)
-    # Para cada equipo: lista de índices donde aparece como local / visitante
     home_indices: dict[str, list[int]] = {}
     away_indices: dict[str, list[int]] = {}
 
@@ -721,7 +843,6 @@ def _precompute_rolling_cache(
 
     def _stats_from_rows(team: str, is_home: bool, rows: pd.DataFrame,
                          ref_date, team_norm: str) -> dict:
-        """Calcula stats de forma a partir de un slice ya filtrado."""
         p        = "home" if is_home else "away"
         col_scored = "home_goals" if is_home else "away_goals"
         col_recv   = "away_goals" if is_home else "home_goals"
@@ -777,23 +898,18 @@ def _precompute_rolling_cache(
             f"{p}_n_matches_total": n_total,
         }
 
-    # Recorrer el histórico una sola vez y acumular stats con ventana deslizante
-    # Para cada partido idx, guardamos las stats con todos los partidos PREVIOS (< idx)
-    all_teams = set(home_indices.keys()) | set(away_indices.keys())
+    all_teams   = set(home_indices.keys()) | set(away_indices.keys())
     total_teams = len(all_teams)
 
     for t_idx, team_norm in enumerate(all_teams):
         if t_idx % 50 == 0:
             log.info(f"  Rolling cache: equipo {t_idx}/{total_teams}")
 
-        # Acumular índices de partidos locales y visitantes progresivamente
         h_idxs = sorted(home_indices.get(team_norm, []))
         a_idxs = sorted(away_indices.get(team_norm, []))
 
-        # Para cada partido del equipo como local, guardar stats pre-partido
         seen_h: list[int] = []
         for i in h_idxs:
-            # past = todos los partidos locales del equipo con índice < i
             past_rows = historical.loc[[j for j in seen_h]]
             ref_date  = historical.at[i, "match_date"]
             cache[(team_norm, True, i)] = _stats_from_rows(
@@ -801,7 +917,6 @@ def _precompute_rolling_cache(
             )
             seen_h.append(i)
 
-        # Para cada partido del equipo como visitante
         seen_a: list[int] = []
         for i in a_idxs:
             past_rows = historical.loc[[j for j in seen_a]]
@@ -818,11 +933,8 @@ def _precompute_rolling_cache(
 def build_training_dataset(historical: pd.DataFrame) -> pd.DataFrame:
     """
     Dataset walk-forward sin data leakage.
-    Incluye partidos de ligas EU y ESPN para entrenamiento unificado.
-
-    OPTIMIZACIÓN v2: pre-computa rolling stats por equipo (O(n)) en lugar de
-    recalcular desde cero en cada iteración (O(n²)). Reducción ~90s → ~5s
-    con 4226 partidos.
+    v7: añade columnas de lesiones y BPI como NaN (no disponibles en histórico)
+    para mantener schema consistente con build_features_for_fixtures.
     """
     import time
     log.info("Construyendo dataset walk-forward (sin leakage)...")
@@ -834,13 +946,11 @@ def build_training_dataset(historical: pd.DataFrame) -> pd.DataFrame:
 
     historical = historical.sort_values("match_date").reset_index(drop=True)
 
-    # Asegurar columnas norm presentes antes de cachear
     if "home_team_norm" not in historical.columns:
         historical["home_team_norm"] = historical["home_team"].apply(normalize_team_name)
     if "away_team_norm" not in historical.columns:
         historical["away_team_norm"] = historical["away_team"].apply(normalize_team_name)
 
-    # Pre-computar rolling stats — O(n) en lugar de O(n²)
     rolling_cache = _precompute_rolling_cache(historical, xg_data, match_summary)
 
     start_idx   = max(200, len(historical) // 4)
@@ -857,7 +967,6 @@ def build_training_dataset(historical: pd.DataFrame) -> pd.DataFrame:
         if not home or not away:
             continue
 
-        # Obtener stats desde cache O(1)
         home_stats = rolling_cache.get(
             (home_norm, True,  idx),
             compute_team_stats(home, True,  historical.iloc[:idx], xg_data,
@@ -869,7 +978,6 @@ def build_training_dataset(historical: pd.DataFrame) -> pd.DataFrame:
                                match_summary, match["match_date"]),
         )
 
-        # H2H: sigue siendo O(n) por partido pero es rápido (slice pequeño)
         h2h      = compute_h2h(home, away, historical.iloc[:idx], match["match_date"])
         elo_diff = get_elo_diff(home, away, elo_df)
 
@@ -887,6 +995,41 @@ def build_training_dataset(historical: pd.DataFrame) -> pd.DataFrame:
             **home_stats,
             **away_stats,
             **h2h,
+            # v7: columnas de lesiones como NaN (no disponibles en histórico)
+            "home_injured_count":  np.nan,
+            "home_injury_score":   np.nan,
+            "home_out_count":      np.nan,
+            "away_injured_count":  np.nan,
+            "away_injury_score":   np.nan,
+            "away_out_count":      np.nan,
+            "injury_score_diff":   np.nan,
+            # v7/v8: BPI — probs como NaN (no disponible en histórico);
+            # flag bpi_available=0 (histórico nunca tiene BPI → fillna(0) correcto)
+            "espn_bpi_home_prob":  np.nan,
+            "espn_bpi_away_prob":  np.nan,
+            "bpi_available":       0,
+            # v11: standings context — inicializado en 0 para histórico
+            # (no tenemos standings históricos, pero el modelo aprende
+            # que 0 = "dato no disponible" y lo pondera menos)
+            "home_relegation_threat":    0,
+            "away_relegation_threat":    0,
+            "home_title_race":           0,
+            "away_title_race":           0,
+            "home_clasif_race":          0,
+            "away_clasif_race":          0,
+            "home_motivation_score":     0.0,
+            "away_motivation_score":     0.0,
+            "home_standing_pts_per_game":0.0,
+            "away_standing_pts_per_game":0.0,
+            "home_points_to_safety":     0.0,
+            "away_points_to_safety":     0.0,
+            "home_es_tramo_final":       0,
+            "away_es_tramo_final":       0,
+            "motivation_diff":           0.0,
+            "pressure_asymmetry":        0.0,
+            "rank_diff":                 0.0,
+            "points_diff_standing":      0.0,
+            # targets
             "target_home_win":     int(hg > ag),
             "target_draw":         int(hg == ag),
             "target_away_win":     int(hg < ag),

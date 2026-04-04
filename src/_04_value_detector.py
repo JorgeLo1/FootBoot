@@ -388,11 +388,16 @@ def build_odds_dict(home_team: str, away_team: str,
 
     Retorna (odds_dict, tiene_cuotas_reales_1x2, método).
     """
+    # FIX v7: compute_all_market_probs genera "prob_btts" (sin _si).
+    # El mercado interno se llama "btts_si" en ALL_MARKETS/evaluate_bet,
+    # pero la clave en market_probs es "prob_btts". Se mapea explícitamente
+    # antes de entrar al loop para que _fair_to_market reciba la prob correcta.
+    _btts_prob = market_probs.get("prob_btts", 0)
     model_odds = {
         mkt: _fair_to_market(market_probs.get(f"prob_{mkt}", 0))
         for mkt in [
             "home_win", "draw", "away_win",
-            "btts_si", "btts_no",
+            "btts_no",
             "over05", "under05", "over15", "under15",
             "over25", "under25", "over35", "under35", "over45", "under45",
             "home_over05", "home_under05", "home_over15", "home_under15",
@@ -405,6 +410,8 @@ def build_odds_dict(home_team: str, away_team: str,
             "ah_home_minus1",  "ah_away_minus1",
         ]
     }
+    # Asignar btts_si con la prob correcta (prob_btts, no prob_btts_si)
+    model_odds["btts_si"] = _fair_to_market(_btts_prob)
 
     # ── Nivel 1: ESPN real ────────────────────────────────────────────────
     if fixture_row.get("espn_odds_available"):
